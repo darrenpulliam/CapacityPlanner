@@ -62,7 +62,7 @@ HISTORY_CSV = DATA_DIR / "history.csv"
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
 
-WAKE_ANCHOR = "07:00"          # fixed every day — the circadian anchor never moves
+WAKE_ANCHOR = "08:30"          # fixed every day — shift-work anchor (bed 12:15 AM / wake 8:30 AM), set 2026-10-07
 SLEEP_NEED_MIN = 480           # 8 h
 SLEEP_LATENCY_MIN = 15         # time to fall asleep
 WIND_DOWN_MIN = 60             # screens off / lights dim before bedtime
@@ -70,8 +70,8 @@ CAFFEINE_CUTOFF_H = 9          # last caffeine this many hours before bedtime
 MAX_PULL_EARLIER_MIN = 45      # bedtime never moves more than this earlier
 
 # Capacity tiers (Body Battery at wake)
-GREEN_MIN = 75
-YELLOW_MIN = 50
+GREEN_MIN = 50                 # recalibrated 2026-10-07 from 12-mo Garmin history (median wake BB ~35)
+YELLOW_MIN = 25
 BAD_HRV = {"UNBALANCED", "LOW", "POOR"}
 TIER_ORDER = ["RED", "YELLOW", "GREEN"]
 TIER_PLAN = {

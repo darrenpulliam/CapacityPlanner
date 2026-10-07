@@ -6,13 +6,13 @@ Standalone project, separate from CrystalBull. Garmin → capacity tier → cale
 
 | Tier | Body Battery at wake | Deep-work blocks | Bedtime shift |
 |---|---|---|---|
-| GREEN | ≥ 75 | 3 | 0 |
-| YELLOW | 50–74 | 2 | −15 min |
-| RED | < 50 | 1 | −30 min |
+| GREEN | ≥ 50 | 3 | 0 |
+| YELLOW | 25–49 | 2 | −15 min |
+| RED | < 25 | 1 | −30 min |
 
 - Drops one tier if sleep score < 60 or HRV status is UNBALANCED/LOW.
 - Sleep debt (an average of under 7h15m over at least 2 nights) moves bedtime another 15 min earlier. Bedtime never moves more than 45 min earlier.
-- Wake is fixed at **7:00 AM**. Sleep need is 8h plus 15 min to fall asleep, so standard bedtime is **10:45 PM**, wind-down starts at 9:45 PM and caffeine cutoff is 1:45 PM. Change these with the constants at the top of `garmin_capacity.py`.
+- Wake is fixed at **8:30 AM** (shift-work anchor). Sleep need is 8h plus 15 min to fall asleep, so standard bedtime is **12:15 AM**, wind-down starts at 11:15 PM and caffeine cutoff is 3:15 PM. Tier cutoffs were recalibrated on 2026-10-07 from 12 months of Garmin history (median Body Battery at wake about 35). Change these with the constants at the top of `garmin_capacity.py`.
 
 **Layout**
 ```
