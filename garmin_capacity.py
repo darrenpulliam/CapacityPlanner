@@ -21,10 +21,16 @@ user environment; leave it blank in .env.
 
 Garmin auth policy (shared with HealthAI's garmin_fetch.py):
   * ONE token store: %USERPROFILE%\\.garminconnect (override: GARMINTOKENS).
-  * Scheduled runs are TOKEN-ONLY. They never attempt a credential login, so a
-    bad password can never trip Garmin's 429 throttle. If the token is missing
-    or rejected the run fails loudly and says to run --setup.
-  * --setup is the only path that logs in with credentials (and MFA).
+  * Scheduled runs try the token first. If it is missing/rejected and
+    GARMIN_EMAIL/GARMIN_PASSWORD are set, they make AT MOST ONE credential
+    login per calendar day (marker: data\.garmin_relogin_state.json), so a bad
+    password can't hammer Garmin into a 429. The retry task never makes a second
+    attempt the same day.
+  * MFA can't be answered unattended: if Garmin asks for a code the run stops
+    and Telegram says to run --setup.
+  * Every fallback outcome (re-login OK / MFA needed / login failed / already
+    tried today) is sent to Telegram.
+  * --setup is the interactive path (email/password/MFA prompts).
   * ONE network fetch per day: if data\\raw\\<date>.json was fetched less than
     CACHE_MAX_AGE_H hours ago it is reused (override with --refresh).
     garmin_fetch.py reads the same raw file, so HealthAI never fetches twice.
@@ -139,16 +145,78 @@ def garmin_client(interactive: bool = False):
         client.login(str(TOKEN_DIR))
         return client
 
-    # Scheduled / non-interactive: TOKEN ONLY. Never pass credentials here — a silent
-    # re-login with a stale password is exactly what trips Garmin's 429 throttle.
+    # Scheduled / non-interactive: token first.
     client = Garmin()
     try:
         client.login(str(TOKEN_DIR))
+        return client
     except Exception as e:
-        raise RuntimeError(
-            f"no valid Garmin token in {TOKEN_DIR} ({type(e).__name__}: {e}). "
-            "Run: python garmin_capacity.py --setup"
-        ) from e
+        token_err = f"{type(e).__name__}: {e}"
+        log.warning("Garmin token rejected/missing in %s (%s)", TOKEN_DIR, token_err)
+
+    return credential_fallback(Garmin, token_err)
+
+
+RELOGIN_STATE = DATA_DIR / ".garmin_relogin_state.json"
+
+
+class MFARequired(Exception):
+    pass
+
+
+def _raise_mfa():
+    raise MFARequired("Garmin asked for an MFA code (can't answer unattended)")
+
+
+def credential_fallback(Garmin, token_err: str):
+    """One unattended credential login per day; Telegram alert on every outcome."""
+    email, password = os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD")
+    today = str(date.today())
+    if not email or not password:
+        send_telegram("⚠️ Capacity: Garmin token expired and no GARMIN_EMAIL/PASSWORD set.\n"
+                      "Run: python garmin_capacity.py --setup")
+        raise RuntimeError(f"no valid Garmin token ({token_err}); no credentials for fallback. Run --setup")
+
+    try:
+        state = json.loads(RELOGIN_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    if state.get("date") == today:
+        # Already tried today — don't risk Garmin's 429 throttle with a second attempt.
+        if state.get("result") != "ok":
+            send_telegram(f"⚠️ Capacity: Garmin still not signed in (today's re-login: {state.get('result')}). "
+                          "Not retrying until tomorrow. Run: python garmin_capacity.py --setup")
+        raise RuntimeError(f"credential re-login already attempted today ({state.get('result')}); not retrying")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RELOGIN_STATE.write_text(json.dumps({"date": today, "result": "attempting"}), encoding="utf-8")
+    log.info("attempting one unattended Garmin credential login")
+    try:
+        client = Garmin(email, password, prompt_mfa=_raise_mfa)
+        client.login(str(TOKEN_DIR))
+        garth = getattr(client, "garth", None)          # older garminconnect: persist tokens ourselves
+        if garth is not None and hasattr(garth, "dump"):
+            try:
+                garth.dump(str(TOKEN_DIR))
+            except Exception as de:
+                log.warning("token dump failed: %s", de)
+    except MFARequired as e:
+        result = "mfa_required"
+        RELOGIN_STATE.write_text(json.dumps({"date": today, "result": result}), encoding="utf-8")
+        send_telegram("🔐 Capacity: Garmin token expired and Garmin wants an MFA code.\n"
+                      "Run on the PC: python garmin_capacity.py --setup")
+        raise RuntimeError(str(e)) from e
+    except Exception as e:
+        result = f"failed ({type(e).__name__})"
+        RELOGIN_STATE.write_text(json.dumps({"date": today, "result": result}), encoding="utf-8")
+        hint = " — likely throttled (429); wait a day" if "429" in str(e) else " — check GARMIN_PASSWORD"
+        send_telegram(f"❌ Capacity: Garmin auto re-login failed: {type(e).__name__}: {e}{hint}\n"
+                      "Run: python garmin_capacity.py --setup")
+        raise RuntimeError(f"Garmin credential re-login failed: {e}") from e
+
+    RELOGIN_STATE.write_text(json.dumps({"date": today, "result": "ok"}), encoding="utf-8")
+    send_telegram(f"🔄 Capacity: Garmin token had expired; re-signed in automatically and saved new tokens to {TOKEN_DIR}.")
+    log.info("Garmin credential re-login OK; tokens saved to %s", TOKEN_DIR)
     return client
 
 
