@@ -29,7 +29,7 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 
 # Times match the live tasks (retimed 2026-10-16 from 07:25/08:40). Capacity_Now has NO trigger:
-# it runs on demand (Start-ScheduledTask \Capacity\Capacity_Now, or /capacity on the CrystalBull bot).
+# it runs on demand (Start-ScheduledTask \Capacity\Capacity_Now, or /capacity on @dp_health_consultant_bot).
 $jobs = @(
     @{ Name = "Capacity_Morning"; At = "09:00"; Args = "" },
     @{ Name = "Capacity_Retry";   At = "10:15"; Args = "--if-missing" },
@@ -46,6 +46,20 @@ foreach ($j in $jobs) {
     Write-Host ("  {0,-18} {1}  logon={2} batteryStop={3} startWhenAvailable={4}" -f $j.Name, $when,
         $t.Principal.LogonType, $t.Settings.StopIfGoingOnBatteries, $t.Settings.StartWhenAvailable) -ForegroundColor Green
 }
+
+# Capacity_Bot (2026-10-18): the planner's own Telegram bot, @dp_health_consultant_bot. Long-running:
+# at logon + at startup, S4U, restart every 1 min on failure (up to 999), no time limit, one instance.
+# No cmd `>>` redirect here: a days-long redirect handle locks data/task.log and the other Capacity tasks
+# then fail to append ("file in use"). capacity_bot.py appends its own lines to task.log, one open per line.
+$botAction = New-ScheduledTaskAction -Execute $Py `
+    -Argument "`"$(Join-Path $Root 'capacity_bot.py')`"" -WorkingDirectory $Root
+$botTriggers = @((New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"), (New-ScheduledTaskTrigger -AtStartup))
+$botSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskPath "\Capacity\" -TaskName "Capacity_Bot" -Action $botAction -Trigger $botTriggers `
+    -Settings $botSettings -Principal $principal -Force | Out-Null
+Write-Host "  Capacity_Bot       at logon + at startup  (restart 1 min x999, no time limit)" -ForegroundColor Green
 
 Write-Host "`n[5/5] Local git repo..." -ForegroundColor Cyan
 Push-Location $Root

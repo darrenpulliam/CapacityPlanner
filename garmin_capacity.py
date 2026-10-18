@@ -19,13 +19,15 @@ with its time, today's high/low, latest stress, latest HR, today's RHR, last wat
 this morning's tier as reference). Always hits Garmin (no raw cache); never touches the
 morning files. Publishes a one-line Telegram card and a [CAPACITY-NOW] mail with a
 <<<CAPACITY_NOW_JSON block. Triggers: Start-ScheduledTask \\Capacity\\Capacity_Now (no
-schedule) or /capacity on the CrystalBull Telegram bot (it runs this script; this script
-never polls Telegram, so there is one getUpdates poller on the bot token).
+schedule) or /capacity on the planner's own bot, @dp_health_consultant_bot ("Health
+Consultant", capacity_bot.py, task \\Capacity\\Capacity_Bot). That bot is the ONE getUpdates
+poller on its token; this script only sends.
 
 Secrets: Windows environment variables win, then .env in this folder, then (only
-with --setup) an interactive prompt. Keys still missing fall back to CrystalBull's
-.env / .env.prod (read-only). GARMIN_PASSWORD should live only in the Windows
-user environment; leave it blank in .env.
+with --setup) an interactive prompt. Since 2026-10-18 there is NO CrystalBull fallback:
+the planner uses only its own .env (its own Telegram bot token since the move off
+@crystalbull_ai_bot). GARMIN_PASSWORD should live only in the Windows user environment;
+leave it blank in .env.
 
 Garmin auth policy (shared with HealthAI's garmin_fetch.py):
   * ONE token store: %USERPROFILE%\\.garminconnect (override: GARMINTOKENS).
@@ -71,7 +73,6 @@ from typing import Any, Dict, List, Optional
 
 # ───────────────────────────── config ─────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent                  # ...\CapacityPlanner
-CB_ENV_FALLBACKS = [Path(r"C:\CrystalBull\CB_v4.0\.env.prod"), Path(r"C:\CrystalBull\CB_v4.0\.env")]
 DATA_DIR = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data")))
 RAW_DIR = DATA_DIR / "raw"
 HISTORY_CSV = DATA_DIR / "history.csv"
@@ -181,16 +182,15 @@ def fmt(dt: datetime) -> str:
 
 
 def load_env():
-    """Own .env wins; CrystalBull env files only fill keys still missing (never override)."""
+    """This folder's .env only (process environment still wins). The CrystalBull .env / .env.prod
+    fallback was removed 2026-10-18: the planner has its own bot (@dp_health_consultant_bot) and
+    must never borrow @crystalbull_ai_bot's token again."""
     try:
         from dotenv import load_dotenv
     except Exception:
         log.warning("python-dotenv missing — using process environment only")
         return
     load_dotenv(BASE_DIR / ".env", override=False)
-    for f in CB_ENV_FALLBACKS:
-        if f.exists():
-            load_dotenv(f, override=False)
 
 
 # ───────────────────────────── Garmin ─────────────────────────────
