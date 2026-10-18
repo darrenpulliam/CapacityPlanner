@@ -39,7 +39,13 @@ foreach ($j in $jobs) {
     $action  = New-ScheduledTaskAction -Execute "cmd.exe" `
         -Argument "/c `"`"$Py`" `"$Script`" $($j.Args) >> `"$Log`" 2>&1`"" -WorkingDirectory $Root
     $reg = @{ TaskPath = "\Capacity\"; TaskName = $j.Name; Action = $action; Settings = $settings; Principal = $principal; Force = $true }
-    if ($j.At) { $reg.Trigger = New-ScheduledTaskTrigger -Daily -At $j.At }
+    if ($j.At) {
+        # DST (2026-10-18): `-At` stores a FIXED offset (e.g. 09:00:00-04:00), which fires an hour early after the
+        # fall-back change. A naive local StartBoundary follows wall-clock time across DST.
+        $trig = New-ScheduledTaskTrigger -Daily -At $j.At
+        $trig.StartBoundary = (Get-Date $j.At).ToString('yyyy-MM-ddTHH:mm:ss')
+        $reg.Trigger = $trig
+    }
     Register-ScheduledTask @reg | Out-Null
     $t = Get-ScheduledTask -TaskPath "\Capacity\" -TaskName $j.Name
     $when = if ($j.At) { $j.At } else { "on demand" }
