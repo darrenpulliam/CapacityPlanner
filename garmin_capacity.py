@@ -14,6 +14,14 @@ tonight's circadian targets, and publishes:
                  A cloud Claude scheduled task ("Capacity calendar writer", 08:52 ET)
                  reads it and writes Capacity / caffeine / wind-down / bedtime / wake events.
 
+On-demand mode (--now, 2026-10-17): current readings through the day (latest Body Battery
+with its time, today's high/low, latest stress, latest HR, today's RHR, last watch sync,
+this morning's tier as reference). Always hits Garmin (no raw cache); never touches the
+morning files. Publishes a one-line Telegram card and a [CAPACITY-NOW] mail with a
+<<<CAPACITY_NOW_JSON block. Triggers: Start-ScheduledTask \\Capacity\\Capacity_Now (no
+schedule) or /capacity on the CrystalBull Telegram bot (it runs this script; this script
+never polls Telegram, so there is one getUpdates poller on the bot token).
+
 Secrets: Windows environment variables win, then .env in this folder, then (only
 with --setup) an interactive prompt. Keys still missing fall back to CrystalBull's
 .env / .env.prod (read-only). GARMIN_PASSWORD should live only in the Windows
@@ -43,6 +51,8 @@ Usage (Python 3.12+):
   python garmin_capacity.py --refresh      # ignore the <20 h raw cache and hit Garmin
   python garmin_capacity.py --mock         # no Garmin call; synthetic data
   python garmin_capacity.py --date 2026-10-06
+  python garmin_capacity.py --now          # current readings -> Telegram + [CAPACITY-NOW] mail
+  python garmin_capacity.py --now --dry-run
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests
 """
@@ -488,7 +498,10 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def send_mail(payload: Dict[str, Any], text: str) -> bool:
+def send_mail(payload: Dict[str, Any], text: str, subject: Optional[str] = None,
+              marker: str = "CAPACITY_JSON") -> bool:
+    """Gmail SMTP (smtplib sends immediately after connect, so it is not hit by the host flow
+    filter). Default subject/marker = the morning [CAPACITY] mail; --now passes its own."""
     import smtplib
     from email.mime.text import MIMEText
     user = (os.getenv("GMAIL_USER") or os.getenv("GMAIL_USERNAME") or os.getenv("GMAIL_ADDRESS")
@@ -498,9 +511,9 @@ def send_mail(payload: Dict[str, Any], text: str) -> bool:
     if not user or not pw:
         log.warning("Gmail credentials not set — capacity mail not sent")
         return False
-    body = text + "\n\n<<<CAPACITY_JSON\n" + json.dumps(payload, indent=2) + "\nCAPACITY_JSON>>>\n"
+    body = text + f"\n\n<<<{marker}\n" + json.dumps(payload, indent=2) + f"\n{marker}>>>\n"
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = f"[CAPACITY] {payload['date']} {payload['tier']} BB{payload['metrics'].get('bb_wake')}"
+    msg["Subject"] = subject or f"[CAPACITY] {payload['date']} {payload['tier']} BB{payload['metrics'].get('bb_wake')}"
     msg["From"], msg["To"] = user, to
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
@@ -512,6 +525,170 @@ def send_mail(payload: Dict[str, Any], text: str) -> bool:
         return False
 
 
+# ───────────────────────────── on-demand NOW mode ─────────────────────────────
+# --now (2026-10-17): "what is my capacity right now", not the wake snapshot. Three Garmin
+# calls on the hardened client: get_stats (today's BB high/low/most-recent, RHR, avg stress,
+# lastSyncTimestampGMT), get_stress_data (3-min stress AND Body Battery series with
+# timestamps) and get_heart_rates (2-min HR series + today's RHR). Never reads the raw
+# cache and never writes data\<date>.json / latest.json / history.csv (those are the morning
+# snapshot the calendar writer consumes); it writes data\now\<date>_<HHMM>.json and
+# data\now_latest.json instead. Garmin series timestamps are epoch ms (GMT); strings such as
+# lastSyncTimestampGMT are GMT without a zone marker.
+NOW_DIR = DATA_DIR / "now"
+NOW_STALE_MIN = 60             # flag the card when the watch last synced more than this many minutes ago
+STRESS_NO_READING = (-1, -2)   # Garmin stress codes: -1 = not measurable, -2 = during activity
+
+
+def _ms_local(ms) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000)
+    except Exception:
+        return None
+
+
+def _gmt_local(s) -> Optional[datetime]:
+    """'2026-10-18T03:11:31.317' (GMT, no zone marker) -> naive local datetime."""
+    try:
+        from datetime import timezone
+        return datetime.fromisoformat(str(s)).replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _descr_index(descriptors, key: str, default: int) -> int:
+    """Column index of `key` in a Garmin descriptor list (both naming styles)."""
+    for d in descriptors or []:
+        if isinstance(d, dict) and key in (d.get("key"), d.get("bodyBatteryValueDescriptorKey")):
+            idx = d.get("index", d.get("bodyBatteryValueDescriptorIndex"))
+            return int(idx) if isinstance(idx, int) else default
+    return default
+
+
+def _last_point(arr, value_idx: int, skip=()):
+    """Latest [timestamp_ms, ...] row whose value column is a real number -> (local dt, value)."""
+    for row in reversed(arr or []):
+        if isinstance(row, list) and len(row) > value_idx:
+            v = row[value_idx]
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v not in skip:
+                return _ms_local(row[0]), v
+    return None, None
+
+
+def pull_now(day: date) -> Dict[str, Any]:
+    c = garmin_client()
+    d = day.isoformat()
+    raw = {
+        "_meta": {"fetched_at": datetime.now().isoformat(timespec="seconds"), "date": d,
+                  "source": "garmin_capacity.py --now"},
+        "stats": safe_call(c.get_stats, d),
+        "stress": safe_call(c.get_stress_data, d),
+        "heart_rates": safe_call(c.get_heart_rates, d),
+    }
+    if dig(raw, "stats", "lastSyncTimestampGMT") is None:        # fallback for the sync time only
+        raw["device"] = safe_call(c.get_device_last_used)
+    return raw
+
+
+def morning_reference(day: date) -> Dict[str, Any]:
+    """This morning's tier from the wake pull (data\\<date>.json), if it exists."""
+    f = DATA_DIR / f"{day}.json"
+    if not f.exists():
+        return {}
+    try:
+        p = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {"tier": p.get("tier"), "bb_wake": dig(p, "metrics", "bb_wake"), "generated_at": p.get("generated_at")}
+
+
+def extract_now(raw: Dict[str, Any], day: date, at: datetime) -> Dict[str, Any]:
+    stats = raw.get("stats") or {}
+    stress = raw.get("stress") or {}
+    hr = raw.get("heart_rates") or {}
+
+    bb_idx = _descr_index(stress.get("bodyBatteryValueDescriptorsDTOList"), "bodyBatteryLevel", 2)
+    bb_at, bb_now = _last_point(stress.get("bodyBatteryValuesArray"), bb_idx)
+    if bb_now is None:
+        bb_now = stats.get("bodyBatteryMostRecentValue")
+    st_idx = _descr_index(stress.get("stressValueDescriptorsDTOList"), "stressLevel", 1)
+    st_at, st_now = _last_point(stress.get("stressValuesArray"), st_idx, skip=STRESS_NO_READING)
+    hr_idx = _descr_index(hr.get("heartRateValueDescriptors"), "heartrate", 1)
+    hr_at, hr_now = _last_point(hr.get("heartRateValues"), hr_idx)
+
+    synced = _gmt_local(stats.get("lastSyncTimestampGMT")) or _ms_local(dig(raw, "device", "lastUsedDeviceUploadTime"))
+    iso = lambda t: t.isoformat(timespec="minutes") if t else None
+    return {
+        "bb_now": bb_now, "bb_now_at": iso(bb_at),
+        "bb_high": stats.get("bodyBatteryHighestValue"), "bb_low": stats.get("bodyBatteryLowestValue"),
+        "bb_wake": stats.get("bodyBatteryAtWakeTime"),
+        "stress_now": st_now, "stress_now_at": iso(st_at),
+        "stress_avg_today": stats.get("averageStressLevel"), "stress_max_today": stats.get("maxStressLevel"),
+        "hr_now": hr_now, "hr_now_at": iso(hr_at),
+        "resting_hr": hr.get("restingHeartRate") or stats.get("restingHeartRate"),
+        "resting_hr_7d": hr.get("lastSevenDaysAvgRestingHeartRate") or stats.get("lastSevenDaysAvgRestingHeartRate"),
+        "hr_min_today": hr.get("minHeartRate") or stats.get("minHeartRate"),
+        "hr_max_today": hr.get("maxHeartRate") or stats.get("maxHeartRate"),
+        "synced_at": iso(synced),
+        "synced_age_min": int((at - synced).total_seconds() // 60) if synced else None,
+        "stale": (int((at - synced).total_seconds() // 60) > NOW_STALE_MIN) if synced else True,
+        "morning": morning_reference(day),
+    }
+
+
+def now_card(payload: Dict[str, Any]) -> str:
+    """Line 1 is the fixed format "NOW <time>: BB <n> (high/low), stress <n>, HR <n>, synced <time>";
+    line 2 carries the reading times, RHR and this morning's tier."""
+    m = payload["metrics"]
+    hm = lambda s: datetime.fromisoformat(s).strftime("%H:%M") if s else "?"
+    age = m.get("synced_age_min")
+    stale = ""
+    if m.get("stale"):
+        stale = f" ⚠️ STALE ({age // 60}h{age % 60:02d} ago)" if isinstance(age, int) else " ⚠️ no sync time"
+    line1 = (f"NOW {hm(payload['generated_at'])}: BB {m.get('bb_now')} ({m.get('bb_high')}/{m.get('bb_low')}), "
+             f"stress {m.get('stress_now')}, HR {m.get('hr_now')}, synced {hm(m.get('synced_at'))}{stale}")
+    mo = m.get("morning") or {}
+    ref = f"Morning {mo.get('tier')} (BB wake {mo.get('bb_wake')})" if mo else "Morning: no wake pull yet today"
+    line2 = (f"{ref} · RHR {m.get('resting_hr')} (7d {m.get('resting_hr_7d')}) · stress avg {m.get('stress_avg_today')} · "
+             f"read BB {hm(m.get('bb_now_at'))} / stress {hm(m.get('stress_now_at'))} / HR {hm(m.get('hr_now_at'))}")
+    return line1 + "\n" + line2
+
+
+def run_now(day: date, dry_run: bool) -> int:
+    at = datetime.now()
+    try:
+        raw = pull_now(day)
+    except Exception as e:
+        log.error("Garmin NOW fetch failed, nothing published: %s", e)
+        return 2
+    if raw.get("stats") is None and raw.get("stress") is None:
+        log.error("Garmin NOW fetch returned no stats and no stress series; nothing published")
+        return 2
+    metrics = extract_now(raw, day, at)
+    payload = {
+        "kind": "capacity_now",
+        "date": str(day),
+        "generated_at": at.isoformat(timespec="seconds"),
+        "metrics": metrics,
+        "source": "garmin",
+        "fetched_at": dig(raw, "_meta", "fetched_at"),
+    }
+    text = now_card(payload)
+    print(text)
+
+    NOW_DIR.mkdir(parents=True, exist_ok=True)
+    (NOW_DIR / f"{day}_{at.strftime('%H%M')}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (DATA_DIR / "now_latest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (DATA_DIR / "now_latest.raw.json").write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
+    if dry_run:
+        return 0
+
+    subject = f"[CAPACITY-NOW] {day} {at.strftime('%H:%M')} BB{metrics.get('bb_now')}"
+    tg = send_telegram(text)
+    ml = send_mail(payload, text, subject=subject, marker="CAPACITY_NOW_JSON")
+    log.info("published NOW: telegram=%s mail=%s", tg, ml)
+    return 0 if (tg or ml) else 2
+
+
 # ───────────────────────────── main ─────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -521,11 +698,17 @@ def main() -> int:
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--refresh", action="store_true", help=f"ignore the <{CACHE_MAX_AGE_H} h raw cache and hit Garmin")
     ap.add_argument("--if-missing", action="store_true", help="retry run: skip if today already published with data")
+    ap.add_argument("--now", action="store_true",
+                    help="on-demand current readings -> Telegram + [CAPACITY-NOW] mail (ignores the raw cache; "
+                         "--dry-run prints only; --mock/--if-missing/--refresh don't apply)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_env()
     day = date.fromisoformat(a.date) if a.date else date.today()
+
+    if a.now:
+        return run_now(day, a.dry_run)
 
     if a.if_missing:
         f = DATA_DIR / f"{day}.json"

@@ -2,7 +2,9 @@
 
 Standalone project, separate from CrystalBull. Garmin → capacity tier → calendar.
 
-**Flow:** Garmin watch → Garmin Connect → `garmin_capacity.py` (Task Scheduler `\Capacity\Capacity_Morning` 07:25, `Capacity_Retry` 08:40) → Telegram card + `[CAPACITY]` mail → cloud Claude task "Capacity calendar writer" (08:52 ET) → Google Calendar (dppharmd@gmail.com).
+**Flow:** Garmin watch → Garmin Connect → `garmin_capacity.py` (Task Scheduler `\Capacity\Capacity_Morning` 09:00, `Capacity_Retry` 10:15; retimed 2026-10-16 from 07:25/08:40) → Telegram card + `[CAPACITY]` mail → cloud Claude task "Capacity calendar writer" (08:52 ET) → Google Calendar (dppharmd@gmail.com).
+
+**On demand (`--now`, 2026-10-17):** current readings through the day: latest Body Battery with its time, today's high/low, latest stress, latest HR, today's RHR, last watch sync (flagged STALE after 60 min) and this morning's tier for reference. Telegram line `NOW <time>: BB <n> (high/low), stress <n>, HR <n>, synced <time>` plus a `[CAPACITY-NOW] <date> <time> BB<n>` mail with a `<<<CAPACITY_NOW_JSON` block. Always calls Garmin; never touches the morning files (writes `data\now\` and `data\now_latest.json`). Run it with `Start-ScheduledTask -TaskPath '\Capacity\' -TaskName Capacity_Now` (no trigger, S4U, logs to `data\task.log`) or `/capacity` on the CrystalBull Telegram bot, which runs the same script. The planner never polls Telegram, so the bot stays the single `getUpdates` poller on the token.
 
 | Tier | Body Battery at wake | Deep-work blocks | Bedtime shift |
 |---|---|---|---|
@@ -28,4 +30,4 @@ CapacityPlanner\
 
 **One fetch per day:** `data\raw\<date>.json` carries `_meta.fetched_at`. A run less than 20 h after that reuses the file instead of calling Garmin (`--refresh` overrides). `garmin_fetch.py` (HealthAI) reads the same raw file first, so the two projects never fetch twice. The raw pull also includes stress, resting HR, body composition, weigh-ins and hydration for HealthAI.
 
-**Debug:** `python garmin_capacity.py --dry-run` · `--mock` · `--refresh` · `--date YYYY-MM-DD`
+**Debug:** `python garmin_capacity.py --dry-run` · `--mock` · `--refresh` · `--date YYYY-MM-DD` · `--now --dry-run`

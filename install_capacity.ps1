@@ -28,18 +28,22 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 
+# Times match the live tasks (retimed 2026-10-16 from 07:25/08:40). Capacity_Now has NO trigger:
+# it runs on demand (Start-ScheduledTask \Capacity\Capacity_Now, or /capacity on the CrystalBull bot).
 $jobs = @(
-    @{ Name = "Capacity_Morning"; At = "07:25"; Args = "" },
-    @{ Name = "Capacity_Retry";   At = "08:40"; Args = "--if-missing" }
+    @{ Name = "Capacity_Morning"; At = "09:00"; Args = "" },
+    @{ Name = "Capacity_Retry";   At = "10:15"; Args = "--if-missing" },
+    @{ Name = "Capacity_Now";     At = $null;   Args = "--now" }
 )
 foreach ($j in $jobs) {
     $action  = New-ScheduledTaskAction -Execute "cmd.exe" `
         -Argument "/c `"`"$Py`" `"$Script`" $($j.Args) >> `"$Log`" 2>&1`"" -WorkingDirectory $Root
-    $trigger = New-ScheduledTaskTrigger -Daily -At $j.At
-    Register-ScheduledTask -TaskPath "\Capacity\" -TaskName $j.Name -Action $action `
-        -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    $reg = @{ TaskPath = "\Capacity\"; TaskName = $j.Name; Action = $action; Settings = $settings; Principal = $principal; Force = $true }
+    if ($j.At) { $reg.Trigger = New-ScheduledTaskTrigger -Daily -At $j.At }
+    Register-ScheduledTask @reg | Out-Null
     $t = Get-ScheduledTask -TaskPath "\Capacity\" -TaskName $j.Name
-    Write-Host ("  {0,-18} {1}  logon={2} batteryStop={3} startWhenAvailable={4}" -f $j.Name, $j.At,
+    $when = if ($j.At) { $j.At } else { "on demand" }
+    Write-Host ("  {0,-18} {1}  logon={2} batteryStop={3} startWhenAvailable={4}" -f $j.Name, $when,
         $t.Principal.LogonType, $t.Settings.StopIfGoingOnBatteries, $t.Settings.StartWhenAvailable) -ForegroundColor Green
 }
 
@@ -50,4 +54,4 @@ git add garmin_capacity.py install_capacity.ps1 README.md .gitignore .env.exampl
 git commit -m "Capacity Planner: Garmin Body Battery -> capacity tier + circadian targets; tasks 07:25/08:40"
 Pop-Location
 
-Write-Host "`nDone. First real run tomorrow 07:25 (retry 08:40)." -ForegroundColor Yellow
+Write-Host "`nDone. First real run tomorrow 09:00 (retry 10:15). On demand: Start-ScheduledTask -TaskPath '\Capacity\' -TaskName Capacity_Now" -ForegroundColor Yellow
