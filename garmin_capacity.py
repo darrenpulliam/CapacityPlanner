@@ -23,7 +23,7 @@ Garmin auth policy (shared with HealthAI's garmin_fetch.py):
   * ONE token store: %USERPROFILE%\\.garminconnect (override: GARMINTOKENS).
   * Scheduled runs try the token first. If it is missing/rejected and
     GARMIN_EMAIL/GARMIN_PASSWORD are set, they make AT MOST ONE credential
-    login per calendar day (marker: data\.garmin_relogin_state.json), so a bad
+    login per calendar day (marker: data\\.garmin_relogin_state.json), so a bad
     password can't hammer Garmin into a 429. The retry task never makes a second
     attempt the same day.
   * MFA can't be answered unattended: if Garmin asks for a code the run stops
@@ -89,6 +89,61 @@ TIER_PLAN = {
 log = logging.getLogger("capacity")
 
 
+# ───────────────────────────── HTTP hardening ─────────────────────────────
+# 2026-10-17 forensic: on this PC any outbound TCP flow whose first client bytes arrive more
+# than ~10 ms after the TCP handshake is black-holed (TLS and plain HTTP alike; 0 ms gap
+# passes 100 %, >=10 ms fails 100 %). That is a host-level flow filter (McAfee and Pango
+# WFP connect-redirect/stream callouts are registered), not Garmin or Telegram. requests/
+# urllib3 opens the socket FIRST and only then loads the CA bundle (40-550 ms) before the
+# ClientHello, so every requests call timed out since 10/12 (Telegram) and 10/16 (Garmin
+# API tier -> "Failed to retrieve social profile" -> needless re-login attempts), while
+# http.client, urllib, curl_cffi and smtplib, which all send immediately, kept working.
+# Fix: hand urllib3 a finished TLS context and suppress per-connection CA loading so
+# nothing runs between connect() and the ClientHello; Telegram goes through stdlib urllib
+# (the same fix CrystalBull made in engines/telegram_transport.py).
+import ssl
+
+import certifi
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_TLS_CTX = ssl.create_default_context(cafile=certifi.where())   # built once, before any socket exists
+
+
+class ImmediateHelloAdapter(HTTPAdapter):
+    """requests adapter whose TLS context is finished before the TCP connect (see above)."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = _TLS_CTX
+        return super().init_poolmanager(*args, **kwargs)
+
+    def cert_verify(self, conn, url, verify, cert):
+        super().cert_verify(conn, url, verify, cert)
+        if verify is True:                 # CA bundle already lives in _TLS_CTX
+            conn.ca_certs = None
+            conn.ca_cert_dir = None
+
+
+def harden_requests_session(s) -> None:
+    """Mount ImmediateHelloAdapter on a requests.Session (keeps garminconnect's 20/20 pool).
+    Retry covers connect errors and read timeouts on idempotent calls only (urllib3 default)."""
+    s.mount("https://", ImmediateHelloAdapter(
+        pool_connections=20, pool_maxsize=20,
+        max_retries=Retry(total=2, connect=2, read=2, backoff_factor=0.3)))
+
+
+def harden_garmin(g):
+    """Harden both requests sessions garminconnect 0.3.x keeps on its Client:
+    `cs` (auth / JWT refresh) and `_api_session` (every connectapi call incl. the
+    socialProfile token check). The DI-token refresh already goes through curl_cffi."""
+    c = getattr(g, "client", None)
+    for name in ("cs", "_api_session"):
+        s = getattr(c, name, None)
+        if s is not None and hasattr(s, "mount"):
+            harden_requests_session(s)
+    return g
+
+
 # ───────────────────────────── helpers ─────────────────────────────
 def dig(obj: Any, *path, default=None):
     """Safe nested get across dicts/lists."""
@@ -141,12 +196,12 @@ def garmin_client(interactive: bool = False):
         # it writes the new token to TOKEN_DIR itself (garminconnect >= 0.3).
         email = os.getenv("GARMIN_EMAIL") or input("Garmin email: ").strip()
         password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
-        client = Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: ").strip())
+        client = harden_garmin(Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: ").strip()))
         client.login(str(TOKEN_DIR))
         return client
 
     # Scheduled / non-interactive: token first.
-    client = Garmin()
+    client = harden_garmin(Garmin())
     try:
         client.login(str(TOKEN_DIR))
         return client
@@ -192,7 +247,7 @@ def credential_fallback(Garmin, token_err: str):
     RELOGIN_STATE.write_text(json.dumps({"date": today, "result": "attempting"}), encoding="utf-8")
     log.info("attempting one unattended Garmin credential login")
     try:
-        client = Garmin(email, password, prompt_mfa=_raise_mfa)
+        client = harden_garmin(Garmin(email, password, prompt_mfa=_raise_mfa))
         client.login(str(TOKEN_DIR))
         garth = getattr(client, "garth", None)          # older garminconnect: persist tokens ourselves
         if garth is not None and hasattr(garth, "dump"):
@@ -416,11 +471,18 @@ def send_telegram(text: str) -> bool:
     if not token or not chat:
         log.warning("Telegram not configured")
         return False
+    # stdlib urllib, not requests: see "HTTP hardening" above (ClientHello must follow connect immediately)
+    import urllib.error
+    import urllib.request
+    body = json.dumps({"chat_id": chat, "text": text}).encode("utf-8")
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
     try:
-        import requests
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat, "text": text}, timeout=15)
-        return r.ok
+        with urllib.request.urlopen(req, timeout=15, context=_TLS_CTX) as r:
+            return 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        log.warning("Telegram failed: HTTP %s %s", e.code, e.read(200))
+        return False
     except Exception as e:
         log.warning("Telegram failed: %s", e)
         return False
