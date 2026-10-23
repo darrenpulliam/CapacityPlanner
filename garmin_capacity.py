@@ -78,9 +78,11 @@ target was not shift-aware; the cloud calendar writer does that comparison from 
 Weather / barometric pain (2026-10-23, sources_extra.fetch_weather, Open-Meteo, no key): the largest
 sea-level pressure change over any 12 h (and 24 h) window from 12 h before to 24 h after the wake
 anchor gives weather.pain_level NONE / LOW / MODERATE / HIGH (WEATHER_PAIN_* hPa thresholds) and
-weather.pain_index 0-10. HIGH joins the one-tier downgrade OR (WEATHER_PAIN_DOWNGRADE_LEVEL);
-MODERATE adds a reason only. Location: WEATHER_PLACE (geocoded once) or WEATHER_LAT/WEATHER_LON
-in .env; unset = source skipped. --no-weather skips it.
+weather.pain_index 0-10. The downgrade is RECORD-ONLY by default (WEATHER_PAIN_DOWNGRADE_ENABLED =
+False, until ~2026-11-13): HIGH adds a "record-only, no tier change" reason and never changes the
+tier; MODERATE adds a reason only. With ENABLED = True, pain_level at/above
+WEATHER_PAIN_DOWNGRADE_LEVEL joins the one-tier downgrade OR. Location: WEATHER_PLACE (geocoded
+once) or WEATHER_LAT/WEATHER_LON in .env; unset = source skipped. --no-weather skips it.
 Payload gains "cpap", "sleepnumber" and "weather" objects (null when missing); subject and JSON markers unchanged.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
@@ -135,10 +137,11 @@ SLEEP_DEBT_SHIFT_MIN = 15      # extra bedtime pull when the sleep-debt flag is 
 # Migraine / joint-pain literature puts the trigger zone at roughly 5-10 hPa; a frontal passage is 6-12.
 WEATHER_PAIN_LOW_HPA_12H = 1.5       # LOW: noticeable to the sensitive, card only
 WEATHER_PAIN_MODERATE_HPA_12H = 3.0  # MODERATE: reason on the card, plan for a pain day
-WEATHER_PAIN_HIGH_HPA_12H = 6.0      # HIGH: joins the one-tier downgrade OR
+WEATHER_PAIN_HIGH_HPA_12H = 6.0      # HIGH: joins the one-tier downgrade OR (only when ENABLED below)
 WEATHER_PAIN_MODERATE_HPA_24H = 5.0  # same two levels on the slower 24 h window
 WEATHER_PAIN_HIGH_HPA_24H = 10.0
 WEATHER_PAIN_DOWNGRADE_LEVEL = "HIGH"   # pain_level at/above this downgrades one tier ("MODERATE" to be stricter)
+WEATHER_PAIN_DOWNGRADE_ENABLED = False  # record-only until ~2026-11-13; then compare pain_level vs bb_wake in history.csv
 WEATHER_PAIN_ORDER = ["NONE", "LOW", "MODERATE", "HIGH"]
 WEATHER_THRESHOLDS = {"low12": WEATHER_PAIN_LOW_HPA_12H, "moderate12": WEATHER_PAIN_MODERATE_HPA_12H,
                       "high12": WEATHER_PAIN_HIGH_HPA_12H, "moderate24": WEATHER_PAIN_MODERATE_HPA_24H,
@@ -416,8 +419,12 @@ MOCK_CASES = {
     "watch-off-nosiq":  {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": None},                  # no SleepIQ: BB 5 -> RED as before
     "weather-low":      {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -2.0, "d24": -2.4}},   # LOW: card only, GREEN stays
     "weather-moderate": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -4.2, "d24": -4.9}},   # MODERATE: reason only, GREEN stays
-    "weather-high":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3}},   # HIGH: joins downgrade -> YELLOW
-    "weather-high-24h": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": 4.0, "d24": 10.5}},    # HIGH via the 24 h window (rising)
+    "weather-high":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3}},   # HIGH, record-only (default): GREEN stays, reason says so
+    "weather-high-on":  {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3},
+                         "downgrade_enabled": True},                                                  # HIGH with ENABLED=True: joins downgrade -> YELLOW
+    "weather-high-24h": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": 4.0, "d24": 10.5}},    # HIGH via the 24 h window (rising), record-only
+    "weather-badlevel": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3},
+                         "downgrade_enabled": True, "downgrade_level": "SEVERE"},                     # misspelt level: warns once, no downgrade
     "weather-none":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": None},                                 # weather source failed: no line change
 }
 
@@ -522,6 +529,22 @@ def pressure_phrase(wx: Dict[str, Any]) -> str:
     return f"{direction} {abs(d):.1f} hPa / {hrs} h{when}"
 
 
+_PAIN_LEVEL_WARNED = False
+
+
+def pain_downgrade_index() -> Optional[int]:
+    """Index of WEATHER_PAIN_DOWNGRADE_LEVEL in WEATHER_PAIN_ORDER, or None (downgrade disabled) when the
+    constant is misspelt — warns once, never raises."""
+    global _PAIN_LEVEL_WARNED
+    if WEATHER_PAIN_DOWNGRADE_LEVEL in WEATHER_PAIN_ORDER:
+        return WEATHER_PAIN_ORDER.index(WEATHER_PAIN_DOWNGRADE_LEVEL)
+    if not _PAIN_LEVEL_WARNED:
+        log.warning("WEATHER_PAIN_DOWNGRADE_LEVEL=%r is not one of %s; barometric downgrade disabled",
+                    WEATHER_PAIN_DOWNGRADE_LEVEL, WEATHER_PAIN_ORDER)
+        _PAIN_LEVEL_WARNED = True
+    return None
+
+
 def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None,
              sn: Optional[Dict[str, Any]] = None, wx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Tier + reasons. Sets m["tier_source"] ("garmin" | "sleepiq" | None for UNKNOWN)."""
@@ -552,8 +575,12 @@ def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None,
     if ahi is not None and ahi >= CPAP_AHI_DOWNGRADE:
         downgrade.append(f"AHI {ahi}")
     pain = (wx or {}).get("pain_level")
-    if pain in WEATHER_PAIN_ORDER and WEATHER_PAIN_ORDER.index(pain) >= WEATHER_PAIN_ORDER.index(WEATHER_PAIN_DOWNGRADE_LEVEL):
-        downgrade.append(f"barometric pain risk {pain} ({pressure_phrase(wx)})")
+    lvl = pain_downgrade_index()
+    if pain in WEATHER_PAIN_ORDER and lvl is not None and WEATHER_PAIN_ORDER.index(pain) >= lvl:
+        if WEATHER_PAIN_DOWNGRADE_ENABLED:
+            downgrade.append(f"barometric pain risk {pain} ({pressure_phrase(wx)})")
+        else:
+            reasons.append(f"barometric pain risk {pain} ({pressure_phrase(wx)}) — record-only, no tier change")
     elif pain == "MODERATE":
         reasons.append(f"barometric pain risk MODERATE ({pressure_phrase(wx)}) — plan for a pain day")
     if downgrade and tier != "RED":
@@ -983,6 +1010,9 @@ def main() -> int:
     cpap = sn = wx = None
     if a.mock:
         cpap, sn, wx = mock_extra(day, a.mock)
+        global WEATHER_PAIN_DOWNGRADE_ENABLED, WEATHER_PAIN_DOWNGRADE_LEVEL       # scenario overrides (mock only)
+        WEATHER_PAIN_DOWNGRADE_ENABLED = MOCK_CASES[a.mock].get("downgrade_enabled", WEATHER_PAIN_DOWNGRADE_ENABLED)
+        WEATHER_PAIN_DOWNGRADE_LEVEL = MOCK_CASES[a.mock].get("downgrade_level", WEATHER_PAIN_DOWNGRADE_LEVEL)
     else:
         try:   # all fetches are best-effort inside sources_extra; this guard covers an import error too
             import sources_extra
