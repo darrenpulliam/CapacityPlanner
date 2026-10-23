@@ -84,6 +84,14 @@ tier; MODERATE adds a reason only. With ENABLED = True, pain_level at/above
 WEATHER_PAIN_DOWNGRADE_LEVEL joins the one-tier downgrade OR. Location: WEATHER_PLACE (geocoded
 once) or WEATHER_LAT/WEATHER_LON in .env; unset = source skipped. --no-weather skips it.
 Payload gains "cpap", "sleepnumber" and "weather" objects (null when missing); subject and JSON markers unchanged.
+Record-only fields (2026-10-23, for the capacity review; they never change tier / bedtime / blocks):
+  metrics.sleep_onset / wake_time / sleep_midpoint (ISO local) + timing_source "garmin" (dailySleepDTO
+  sleepStart/EndTimestampLocal) -> "sleepiq" (bed_entry / bed_exit) -> null; metrics.alcohol_drinks =
+  last night's /drinks entry from data\\alcohol.csv (capacity_bot.py), null when nothing was logged —
+  never assumed 0. history.csv gains sleep_onset, wake_time, sleep_midpoint, timing_source,
+  alcohol_drinks (appended; existing columns untouched). bedtime_target in history.csv is this
+  script's fixed-wake anchor and is NOT shift-aware; the shift-aware targets are the calendar's
+  bedtime / wake events. backfill_sleep_history.py fills data\\history_backfill.csv for the last year.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -105,6 +113,9 @@ BASE_DIR = Path(__file__).resolve().parent                  # ...\CapacityPlanne
 DATA_DIR = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data")))
 RAW_DIR = DATA_DIR / "raw"
 HISTORY_CSV = DATA_DIR / "history.csv"
+ALCOHOL_CSV = DATA_DIR / "alcohol.csv"      # night_date,drinks,logged_at,source — append-only, last row per night wins
+ALCOHOL_MAX_DRINKS = 10.0                    # /drinks accepts 0-10 in halves
+ALCOHOL_CUTOVER_H = 14                       # /drinks before 14:00 = last night; from 14:00 on = tonight
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
 
@@ -406,6 +417,11 @@ _NO_SLEEP_RAW = {   # watch not worn: no Garmin sleep record, Body Battery charg
     "hrv": None,
     "body_battery": [{"charged": 0, "drained": 0, "bodyBatteryValuesArray": [[1792728000000, 5], [1792730520000, 5]]}],
 }
+_GARMIN_TIMED_SLEEP = {   # 2026-10-22 shape: Local timestamps are wall-clock epoch ms (23:03 -> 08:44)
+    "dailySleepDTO": {"sleepTimeSeconds": 33900, "sleepScores": {"overall": {"value": 71}},
+                      "sleepStartTimestampLocal": 1792633439000, "sleepEndTimestampLocal": 1792668299000},
+    "avgOvernightHrv": 41, "hrvStatus": "BALANCED",
+}
 MOCK_CASES = {
     "default":          {},                                                       # BB 68 GREEN; AHI 6.3 -> YELLOW; usage 212 -> sleep-debt flag
     "seal-score":       {"cpap": {"leak_95": 9.6, "mask_seal_score": 10}},        # mask seal via seal score < CPAP_MASK_SEAL_LOW
@@ -426,6 +442,12 @@ MOCK_CASES = {
     "weather-badlevel": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3},
                          "downgrade_enabled": True, "downgrade_level": "SEVERE"},                     # misspelt level: warns once, no downgrade
     "weather-none":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": None},                                 # weather source failed: no line change
+    # record-only fields (sleep timing + alcohol); none of these may change tier / bedtime / blocks
+    "timing-garmin":    {"raw": {"sleep": _GARMIN_TIMED_SLEEP}},                                              # onset/wake from Garmin (watch)
+    "timing-sleepiq":   {},                                                                                  # default raw has no Garmin timestamps -> SleepIQ bed entry/exit
+    "timing-null":      {"sn": None},                                                                         # neither -> nulls, "no timing" line
+    "alcohol-logged":   {"alcohol": 2},                                                                       # metrics.alcohol_drinks 2 -> "Alcohol last night: 2"
+    "alcohol-none":     {"alcohol": None},                                                                    # not logged -> null, never 0
 }
 
 
@@ -503,6 +525,62 @@ def merge_extra(m: Dict[str, Any], cpap: Optional[Dict[str, Any]], sn: Optional[
     else:
         m["sleep_source"] = None
     return m
+
+
+def _garmin_local_ms(ms) -> Optional[datetime]:
+    """Garmin '...TimestampLocal' = epoch ms already shifted to wall-clock time, so decode it as UTC."""
+    try:
+        from datetime import timezone
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def sleep_timing(raw: Optional[Dict[str, Any]], sn: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Record-only: when the night started / ended. Garmin sleep record first, SleepIQ bed entry/exit
+    second, else nulls. Never raises (a failure logs and returns nulls)."""
+    out = {"sleep_onset": None, "wake_time": None, "sleep_midpoint": None, "timing_source": None}
+    try:
+        dto = dig(raw, "sleep", "dailySleepDTO") or {}
+        start, end = _garmin_local_ms(dto.get("sleepStartTimestampLocal")), _garmin_local_ms(dto.get("sleepEndTimestampLocal"))
+        src = "garmin"
+        if not (start and end and end > start):
+            start = end = None
+            if sn and sn.get("bed_entry") and sn.get("bed_exit"):
+                start, end = datetime.fromisoformat(sn["bed_entry"]), datetime.fromisoformat(sn["bed_exit"])
+                src = "sleepiq"
+        if start and end and end > start:
+            out.update(sleep_onset=start.isoformat(timespec="minutes"), wake_time=end.isoformat(timespec="minutes"),
+                       sleep_midpoint=(start + (end - start) / 2).isoformat(timespec="minutes"), timing_source=src)
+    except Exception as e:
+        log.warning("sleep timing skipped: %s: %s", type(e).__name__, e)
+    return out
+
+
+def alcohol_log(night: date, drinks: float, source: str = "telegram", at: Optional[datetime] = None) -> None:
+    """Append one row to data\\alcohol.csv. Re-logging a night appends again; readers take the LAST row."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new = not ALCOHOL_CSV.exists() or ALCOHOL_CSV.stat().st_size == 0
+    with ALCOHOL_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["night_date", "drinks", "logged_at", "source"])
+        w.writerow([night.isoformat(), f"{drinks:g}", (at or datetime.now()).isoformat(timespec="seconds"), source])
+
+
+def alcohol_for_night(night: date) -> Optional[float]:
+    """Last logged drinks for `night` (the evening's date), or None when nothing was logged — never 0 by default."""
+    try:
+        if not ALCOHOL_CSV.exists():
+            return None
+        val = None
+        for r in csv.DictReader(ALCOHOL_CSV.open(encoding="utf-8")):
+            if r.get("night_date") == night.isoformat() and r.get("drinks") not in (None, ""):
+                val = float(r["drinks"])
+        return val
+    except Exception as e:
+        log.warning("alcohol log unreadable: %s: %s", type(e).__name__, e)
+        return None
 
 
 def _hm(iso: Optional[str]) -> str:
@@ -656,7 +734,8 @@ def save(day: date, payload: Dict[str, Any], raw: Dict[str, Any]):
     m = payload["metrics"]
     fields = ["date", "tier", "bb_wake", "sleep_min", "sleep_score", "hrv_last_night", "hrv_status",
               "stress_avg_yesterday", "resting_hr", "readiness_score", "bedtime_target",
-              "pressure_hpa", "pressure_d12_hpa", "pain_level"]       # weather columns added 2026-10-23 (older rows blank)
+              "pressure_hpa", "pressure_d12_hpa", "pain_level",       # weather columns added 2026-10-23 (older rows blank)
+              "sleep_onset", "wake_time", "sleep_midpoint", "timing_source", "alcohol_drinks"]   # record-only, 2026-10-23
     w = payload.get("weather") or {}
     row = {"date": str(day), "tier": payload["tier"], "bedtime_target": payload["circadian"]["bedtime_target"],
            "pressure_hpa": w.get("pressure_hpa"), "pressure_d12_hpa": w.get("d12_hpa"), "pain_level": w.get("pain_level"),
@@ -686,6 +765,8 @@ def card(payload: Dict[str, Any]) -> str:
         f"{cpap_line(payload.get('cpap'))}\n"
         f"{sleepnumber_line(payload.get('sleepnumber'))}\n"
         f"{weather_line(payload.get('weather'))}\n"
+        f"{slept_line(m)}\n"
+        f"{alcohol_line(m)}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
         f"{payload['plan'].get('guidance', '')}\n"
         f"Caffeine cutoff {t(c['caffeine_cutoff'])} · Wind-down {t(c['wind_down_start'])} · "
@@ -712,6 +793,28 @@ def sleepnumber_line(s: Optional[Dict[str, Any]]) -> str:
     return (f"SleepIQ {s.get('sleepiq_score')}  |  in bed {in_bed} (restful {s.get('restful_min')} / "
             f"restless {s.get('restless_min')} min)  |  HR {s.get('avg_hr')}  |  HRV {s.get('avg_hrv')}  |  "
             f"RR {s.get('avg_rr')}  |  bed {_hm(s.get('bed_entry'))}")
+
+
+def _clock(iso: Optional[str]) -> str:
+    try:
+        d = datetime.fromisoformat(iso)
+        return d.strftime("%#I:%M %p") if os.name == "nt" else d.strftime("%-I:%M %p")
+    except Exception:
+        return "?"
+
+
+def slept_line(m: Dict[str, Any]) -> str:
+    if not m.get("sleep_onset") or not m.get("wake_time"):
+        return "Slept: no timing (watch off, no SleepIQ)"
+    src = {"garmin": "watch", "sleepiq": "bed"}.get(m.get("timing_source"), m.get("timing_source"))
+    return f"Slept {_clock(m['sleep_onset'])} → {_clock(m['wake_time'])} ({src})"
+
+
+def alcohol_line(m: Dict[str, Any]) -> str:
+    v = m.get("alcohol_drinks")
+    if v is None:
+        return "Alcohol last night: not logged — /drinks N"
+    return f"Alcohol last night: {v:g}"
 
 
 def weather_line(w: Optional[Dict[str, Any]]) -> str:
@@ -1024,6 +1127,9 @@ def main() -> int:
         except Exception as e:
             log.warning("extra sources skipped: %s: %s", type(e).__name__, e)
     metrics = merge_extra(metrics, cpap, sn)
+    metrics.update(sleep_timing(raw, sn))                                     # record-only
+    metrics["alcohol_drinks"] = (MOCK_CASES[a.mock].get("alcohol") if a.mock
+                                 else alcohol_for_night(day - timedelta(days=1)))   # None = not logged (never 0)
     cls = classify(metrics, cpap, sn, wx)
     tier = cls["tier"]
     payload = {

@@ -10,8 +10,12 @@ Long-polls getUpdates with stdlib urllib and the pre-built TLS context from garm
 Commands (owner chat only; TELEGRAM_CHAT_ID in this folder's .env, never anyone else):
   /capacity  run `garmin_capacity.py --now`; it posts the NOW card itself (and mails [CAPACITY-NOW])
   /today     repost this morning's card from data\\latest.json
+  /drinks N  log last night's / tonight's alcohol (0-10, halves OK) to data\\alcohol.csv — record-only.
+             Before 14:00 the entry is for LAST night (yesterday's date), from 14:00 on for TONIGHT (today's
+             date); an explicit date wins: /drinks 2 10/22. Re-logging a night appends a new row; the
+             morning run takes the last row (garmin_capacity.alcohol_for_night). Never assumes 0.
   /help      list the commands
-Anything else gets a one-line hint. The three commands are registered with setMyCommands at start.
+Anything else gets a one-line hint. The commands are registered with setMyCommands at start.
 
 Safety and liveness:
   * single instance: data\\capacity_bot.lock holds the PID; a second copy exits 0 if the holder is alive.
@@ -35,7 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -52,9 +56,12 @@ NOW_TIMEOUT_S = 240
 COMMANDS = [
     {"command": "capacity", "description": "Current Body Battery, stress, HR (live Garmin pull)"},
     {"command": "today", "description": "This morning's capacity card"},
+    {"command": "drinks", "description": "Log alcohol: /drinks N [M/D] (0-10; before 2 PM = last night)"},
     {"command": "help", "description": "List the commands"},
 ]
-HINT = "Unknown command. Try /capacity, /today or /help."
+HINT = "Unknown command. Try /capacity, /today, /drinks or /help."
+DRINKS_USAGE = ("Usage: /drinks N [M/D]  — N = 0-10 drinks (halves OK, e.g. 1.5). "
+                "Before 2 PM it counts for last night, from 2 PM on for tonight; add a date to override: /drinks 2 10/22")
 
 log = logging.getLogger("capacity_bot")
 TASK_LOG = DATA_DIR / "task.log"
@@ -237,6 +244,63 @@ def today_card() -> str:
     return text
 
 
+def parse_drinks(args: str, now: datetime) -> tuple:
+    """'2' / '1.5 10/22' / '0 2026-10-22' -> (night_date, drinks). ValueError on anything else.
+    Night attribution without a date: before ALCOHOL_CUTOVER_H (14:00) = last night (yesterday's date),
+    from 14:00 on = tonight (today's date). M/D without a year = the most recent such date not after today."""
+    parts = (args or "").split()
+    if not parts or len(parts) > 2:
+        raise ValueError("need N [date]")
+    try:
+        n = float(parts[0])
+    except ValueError:
+        raise ValueError("N must be a number") from None
+    if not (0 <= n <= gc.ALCOHOL_MAX_DRINKS) or (n * 2) != int(n * 2):
+        raise ValueError("N must be 0-10 in halves")
+    if len(parts) == 2:
+        night = _parse_night(parts[1], now.date())
+    else:
+        night = now.date() - timedelta(days=1) if now.hour < gc.ALCOHOL_CUTOVER_H else now.date()
+    return night, n
+
+
+def _parse_night(txt: str, today: date) -> date:
+    t = txt.strip().lower()
+    if t in ("yesterday", "lastnight", "last-night"):
+        return today - timedelta(days=1)
+    if t in ("today", "tonight"):
+        return today
+    try:
+        return date.fromisoformat(t)
+    except ValueError:
+        pass
+    bits = t.split("/")
+    if len(bits) in (2, 3) and all(b.isdigit() for b in bits):
+        m, d = int(bits[0]), int(bits[1])
+        if len(bits) == 3:
+            y = int(bits[2]) + (2000 if int(bits[2]) < 100 else 0)
+            return date(y, m, d)
+        cand = date(today.year, m, d)
+        return cand if cand <= today else date(today.year - 1, m, d)
+    raise ValueError("date must be M/D, M/D/YYYY or YYYY-MM-DD")
+
+
+def cmd_drinks(args: str, now: Optional[datetime] = None) -> str:
+    """Reply text for /drinks. Logs to data\\alcohol.csv; bad input -> usage hint (nothing logged)."""
+    now = now or datetime.now()
+    try:
+        night, n = parse_drinks(args, now)
+    except ValueError as e:
+        return f"{DRINKS_USAGE}\n({e})"
+    try:
+        gc.alcohol_log(night, n, source="telegram", at=now)
+    except Exception as e:
+        log.warning("alcohol log write failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not write data\\alcohol.csv ({type(e).__name__}); nothing logged."
+    unit = "drink" if n == 1 else "drinks"
+    return f"Logged {n:g} {unit} for {night.strftime('%a')} {night.month}/{night.day}."
+
+
 def help_text() -> str:
     return "Health Consultant — capacity planner\n" + "\n".join(f"/{c['command']} - {c['description']}" for c in COMMANDS)
 
@@ -260,6 +324,10 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
     if cmd == "today":
         send(chat_id, today_card())
         return "today"
+    if cmd == "drinks":
+        args = (message.get("text") or "").strip().split(None, 1)
+        send(chat_id, cmd_drinks(args[1] if len(args) > 1 else ""))
+        return "drinks"
     if cmd in ("help", "start"):
         send(chat_id, help_text())
         return "help"
