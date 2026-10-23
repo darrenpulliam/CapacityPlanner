@@ -57,6 +57,7 @@ Usage (Python 3.12+):
   python garmin_capacity.py --now --dry-run
   python garmin_capacity.py --setup-myair    # one-time ResMed myAir login (e-mail/password, e-mailed MFA code)
   python garmin_capacity.py --setup-sleepiq  # one-time Sleep Number login; picks Darren's side if 2 sleepers
+  python garmin_capacity.py --weather        # print today's weather / barometric pain object and exit
 
 Extra sources (2026-10-23, sources_extra.py): ResMed myAir (CPAP usage, AHI, 95th-pct leak, mask seal
 score 0-20, mask on/off score 0-5 + count, myAir score) and Sleep Number SleepIQ (score, in-bed /
@@ -74,7 +75,13 @@ comes from the SleepIQ score instead (SLEEPIQ_GREEN_MIN / SLEEPIQ_YELLOW_MIN) an
 downgrade OR still applies; metrics.tier_source = "garmin" | "sleepiq" says which. No SleepIQ either:
 unchanged (Body Battery as before). The "Actual bed vs target" reason was dropped the same day: its
 target was not shift-aware; the cloud calendar writer does that comparison from the calendar.
-Payload gains "cpap" and "sleepnumber" objects (null when missing); subject and JSON markers unchanged.
+Weather / barometric pain (2026-10-23, sources_extra.fetch_weather, Open-Meteo, no key): the largest
+sea-level pressure change over any 12 h (and 24 h) window from 12 h before to 24 h after the wake
+anchor gives weather.pain_level NONE / LOW / MODERATE / HIGH (WEATHER_PAIN_* hPa thresholds) and
+weather.pain_index 0-10. HIGH joins the one-tier downgrade OR (WEATHER_PAIN_DOWNGRADE_LEVEL);
+MODERATE adds a reason only. Location: WEATHER_PLACE (geocoded once) or WEATHER_LAT/WEATHER_LON
+in .env; unset = source skipped. --no-weather skips it.
+Payload gains "cpap", "sleepnumber" and "weather" objects (null when missing); subject and JSON markers unchanged.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -123,6 +130,19 @@ CPAP_MASK_SEAL_LOW = 15        # myAir mask SEAL score (GraphQL leakScore, 0-20)
 SLEEPIQ_GREEN_MIN = 80         # watch-not-worn fallback: SleepIQ score at/above this = GREEN base tier
 SLEEPIQ_YELLOW_MIN = 60        #   ... at/above this = YELLOW, below = RED (only when Garmin BB is untrusted)
 SLEEP_DEBT_SHIFT_MIN = 15      # extra bedtime pull when the sleep-debt flag is set (shared with the 3-night average)
+
+# Weather / barometric pain (2026-10-23): |pressure change| over the worst 12 h / 24 h window, in hPa.
+# Migraine / joint-pain literature puts the trigger zone at roughly 5-10 hPa; a frontal passage is 6-12.
+WEATHER_PAIN_LOW_HPA_12H = 1.5       # LOW: noticeable to the sensitive, card only
+WEATHER_PAIN_MODERATE_HPA_12H = 3.0  # MODERATE: reason on the card, plan for a pain day
+WEATHER_PAIN_HIGH_HPA_12H = 6.0      # HIGH: joins the one-tier downgrade OR
+WEATHER_PAIN_MODERATE_HPA_24H = 5.0  # same two levels on the slower 24 h window
+WEATHER_PAIN_HIGH_HPA_24H = 10.0
+WEATHER_PAIN_DOWNGRADE_LEVEL = "HIGH"   # pain_level at/above this downgrades one tier ("MODERATE" to be stricter)
+WEATHER_PAIN_ORDER = ["NONE", "LOW", "MODERATE", "HIGH"]
+WEATHER_THRESHOLDS = {"low12": WEATHER_PAIN_LOW_HPA_12H, "moderate12": WEATHER_PAIN_MODERATE_HPA_12H,
+                      "high12": WEATHER_PAIN_HIGH_HPA_12H, "moderate24": WEATHER_PAIN_MODERATE_HPA_24H,
+                      "high24": WEATHER_PAIN_HIGH_HPA_24H}
 TIER_PLAN = {
     "GREEN":  {"deep_blocks": 3, "bedtime_shift": 0,   "guidance": "Full capacity. Front-load the hardest work; outings/events OK."},
     "YELLOW": {"deep_blocks": 2, "bedtime_shift": -15, "guidance": "Moderate. Two deep blocks max, protect the afternoon dip, no new commitments after 6 PM."},
@@ -394,11 +414,29 @@ MOCK_CASES = {
     "watch-off-ahi":    {"raw": _NO_SLEEP_RAW, "cpap": {"ahi": 5.0, "usage_min": 419, "leak_95": 34.8,
                                                         "mask_seal_score": 10}, "sn": {"sleepiq_score": 73}},  # 10/23: SleepIQ YELLOW, AHI -> RED
     "watch-off-nosiq":  {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": None},                  # no SleepIQ: BB 5 -> RED as before
+    "weather-low":      {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -2.0, "d24": -2.4}},   # LOW: card only, GREEN stays
+    "weather-moderate": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -4.2, "d24": -4.9}},   # MODERATE: reason only, GREEN stays
+    "weather-high":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": -7.1, "d24": -9.3}},   # HIGH: joins downgrade -> YELLOW
+    "weather-high-24h": {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": {"d12": 4.0, "d24": 10.5}},    # HIGH via the 24 h window (rising)
+    "weather-none":     {"cpap": {"ahi": 2.1, "usage_min": 420}, "wx": None},                                 # weather source failed: no line change
 }
 
 
+def mock_weather(day: date, d12: float = -0.8, d24: float = 1.2) -> Dict[str, Any]:
+    from sources_extra import pain_from_pressure
+    pain = pain_from_pressure(d12, d24, WEATHER_PAIN_MODERATE_HPA_12H, WEATHER_PAIN_HIGH_HPA_12H,
+                              WEATHER_PAIN_MODERATE_HPA_24H, WEATHER_PAIN_HIGH_HPA_24H, WEATHER_PAIN_LOW_HPA_12H)
+    return {"pressure_hpa": 1013.2, "trend_3h_hpa": round(d12 / 4, 1),
+            "d12_hpa": d12, "d12_window": [f"{day}T08:00", f"{day}T20:00"],
+            "d24_hpa": d24, "d24_window": [f"{day - timedelta(days=1)}T20:00", f"{day}T20:00"],
+            "pressure_min_hpa": 1006.1, "pressure_max_hpa": 1014.0, **pain,
+            "temp_f": 54.3, "temp_high_f": 63.0, "humidity_pct": 71, "precip_prob_max_pct": 40,
+            "condition": "overcast", "location": "Mock, KY", "lat": 38.2, "lon": -84.9,
+            "anchor": f"{day}T08:00", "date": str(day)}
+
+
 def mock_extra(day: date, case: str = "default"):
-    """Synthetic myAir / SleepIQ objects for --mock, overlaid with the scenario's overrides."""
+    """Synthetic myAir / SleepIQ / weather objects for --mock, overlaid with the scenario's overrides."""
     cpap = {"usage_min": 212, "ahi": 6.3, "leak_95": 9.6, "mask_seal_score": 19, "mask_onoff_score": 4,
             "mask_pairs": 3, "myair_score": 78, "date": str(day - timedelta(days=1))}
     sn = {"sleepiq_score": 64, "in_bed_min": 431, "restful_min": 362, "restless_min": 55, "out_of_bed_min": 14,
@@ -409,7 +447,8 @@ def mock_extra(day: date, case: str = "default"):
         cpap = None if c["cpap"] is None else {**cpap, **c["cpap"]}
     if "sn" in c:
         sn = None if c["sn"] is None else {**sn, **c["sn"]}
-    return cpap, sn
+    wx = None if c.get("wx", {}) is None else mock_weather(day, **c.get("wx") or {})
+    return cpap, sn, wx
 
 
 # ───────────────────────────── metrics ─────────────────────────────
@@ -473,8 +512,18 @@ def bb_untrusted(m: Dict[str, Any]) -> bool:
     return m.get("sleep_source") != "garmin" and m.get("bb_charged_overnight") == 0
 
 
+def pressure_phrase(wx: Dict[str, Any]) -> str:
+    """'falling 7.1 hPa 02:00-14:00' from the worst 12 h window (24 h window if that is the stronger one)."""
+    d12, d24 = wx.get("d12_hpa") or 0.0, wx.get("d24_hpa") or 0.0
+    use24 = abs(d24) / WEATHER_PAIN_HIGH_HPA_24H > abs(d12) / WEATHER_PAIN_HIGH_HPA_12H
+    d, win, hrs = (d24, wx.get("d24_window"), 24) if use24 else (d12, wx.get("d12_window"), 12)
+    direction = "falling" if d < 0 else "rising" if d > 0 else "flat"
+    when = f" {win[0][11:16]}-{win[1][11:16]}" + (" (+1)" if win[1][:10] > win[0][:10] else "") if win else ""
+    return f"{direction} {abs(d):.1f} hPa / {hrs} h{when}"
+
+
 def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None,
-             sn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             sn: Optional[Dict[str, Any]] = None, wx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Tier + reasons. Sets m["tier_source"] ("garmin" | "sleepiq" | None for UNKNOWN)."""
     bb = m.get("bb_wake")
     reasons: List[str] = []
@@ -502,6 +551,11 @@ def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None,
     ahi = cpap.get("ahi") if cpap else None
     if ahi is not None and ahi >= CPAP_AHI_DOWNGRADE:
         downgrade.append(f"AHI {ahi}")
+    pain = (wx or {}).get("pain_level")
+    if pain in WEATHER_PAIN_ORDER and WEATHER_PAIN_ORDER.index(pain) >= WEATHER_PAIN_ORDER.index(WEATHER_PAIN_DOWNGRADE_LEVEL):
+        downgrade.append(f"barometric pain risk {pain} ({pressure_phrase(wx)})")
+    elif pain == "MODERATE":
+        reasons.append(f"barometric pain risk MODERATE ({pressure_phrase(wx)}) — plan for a pain day")
     if downgrade and tier != "RED":
         tier = TIER_ORDER[TIER_ORDER.index(tier) - 1]      # OR of all flags: still exactly one tier
         reasons.append("downgraded one tier: " + ", ".join(downgrade))
@@ -574,8 +628,11 @@ def save(day: date, payload: Dict[str, Any], raw: Dict[str, Any]):
 
     m = payload["metrics"]
     fields = ["date", "tier", "bb_wake", "sleep_min", "sleep_score", "hrv_last_night", "hrv_status",
-              "stress_avg_yesterday", "resting_hr", "readiness_score", "bedtime_target"]
+              "stress_avg_yesterday", "resting_hr", "readiness_score", "bedtime_target",
+              "pressure_hpa", "pressure_d12_hpa", "pain_level"]       # weather columns added 2026-10-23 (older rows blank)
+    w = payload.get("weather") or {}
     row = {"date": str(day), "tier": payload["tier"], "bedtime_target": payload["circadian"]["bedtime_target"],
+           "pressure_hpa": w.get("pressure_hpa"), "pressure_d12_hpa": w.get("d12_hpa"), "pain_level": w.get("pain_level"),
            **{k: m.get(k) for k in fields if k in m}}
     rows = []
     if HISTORY_CSV.exists():
@@ -601,6 +658,7 @@ def card(payload: Dict[str, Any]) -> str:
         f"HRV {m.get('hrv_last_night')} ({m.get('hrv_status')})  |  RHR {m.get('resting_hr')}  |  Readiness {m.get('readiness_score')}\n"
         f"{cpap_line(payload.get('cpap'))}\n"
         f"{sleepnumber_line(payload.get('sleepnumber'))}\n"
+        f"{weather_line(payload.get('weather'))}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
         f"{payload['plan'].get('guidance', '')}\n"
         f"Caffeine cutoff {t(c['caffeine_cutoff'])} · Wind-down {t(c['wind_down_start'])} · "
@@ -627,6 +685,19 @@ def sleepnumber_line(s: Optional[Dict[str, Any]]) -> str:
     return (f"SleepIQ {s.get('sleepiq_score')}  |  in bed {in_bed} (restful {s.get('restful_min')} / "
             f"restless {s.get('restless_min')} min)  |  HR {s.get('avg_hr')}  |  HRV {s.get('avg_hrv')}  |  "
             f"RR {s.get('avg_rr')}  |  bed {_hm(s.get('bed_entry'))}")
+
+
+def weather_line(w: Optional[Dict[str, Any]]) -> str:
+    if not w:
+        return "Weather: no data"
+    pain = w.get("pain_level") or "n/a"
+    wx = f"{w.get('temp_f')}°F" + (f"/{w.get('temp_high_f')}" if w.get("temp_high_f") is not None else "")
+    if w.get("condition"):
+        wx += f" {w['condition']}"
+    if w.get("precip_prob_max_pct"):
+        wx += f", precip {w['precip_prob_max_pct']}%"
+    return (f"Weather {w.get('pressure_hpa')} hPa {pressure_phrase(w)}  |  pain risk {pain} "
+            f"({w.get('pain_index')}/10)  |  {wx}")
 
 
 def send_telegram(text: str) -> bool:
@@ -858,6 +929,8 @@ def main() -> int:
     ap.add_argument("--setup-myair", action="store_true", help="interactive ResMed myAir login (e-mail MFA), saves tokens")
     ap.add_argument("--setup-sleepiq", action="store_true", help="interactive Sleep Number login, picks the sleeper")
     ap.add_argument("--no-extra", action="store_true", help="skip the myAir / SleepIQ fetch (Garmin only)")
+    ap.add_argument("--no-weather", action="store_true", help="skip the Open-Meteo barometric-pain fetch")
+    ap.add_argument("--weather", action="store_true", help="print today's weather / barometric pain object and exit")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -875,6 +948,13 @@ def main() -> int:
 
     if a.now:
         return run_now(day, a.dry_run)
+
+    if a.weather:
+        import sources_extra
+        wx = sources_extra.fetch_weather(day, WEATHER_THRESHOLDS)
+        print(weather_line(wx))
+        print(json.dumps(wx, indent=2))
+        return 0 if wx else 1
 
     if a.if_missing:
         f = DATA_DIR / f"{day}.json"
@@ -900,18 +980,21 @@ def main() -> int:
                 log.error("Garmin fetch failed, nothing published: %s", e)
                 return 2
     metrics = extract(raw)
-    cpap = sn = None
+    cpap = sn = wx = None
     if a.mock:
-        cpap, sn = mock_extra(day, a.mock)
-    elif not a.no_extra:
-        try:   # both fetches are best-effort inside sources_extra; this guard covers an import error too
+        cpap, sn, wx = mock_extra(day, a.mock)
+    else:
+        try:   # all fetches are best-effort inside sources_extra; this guard covers an import error too
             import sources_extra
-            cpap = sources_extra.fetch_cpap(day)
-            sn = sources_extra.fetch_sleepnumber(day)
+            if not a.no_extra:
+                cpap = sources_extra.fetch_cpap(day)
+                sn = sources_extra.fetch_sleepnumber(day)
+            if not a.no_weather:
+                wx = sources_extra.fetch_weather(day, WEATHER_THRESHOLDS)
         except Exception as e:
             log.warning("extra sources skipped: %s: %s", type(e).__name__, e)
     metrics = merge_extra(metrics, cpap, sn)
-    cls = classify(metrics, cpap, sn)
+    cls = classify(metrics, cpap, sn, wx)
     tier = cls["tier"]
     payload = {
         "date": str(day),
@@ -923,6 +1006,7 @@ def main() -> int:
         "circadian": circadian(day, tier, metrics, cls.get("sleep_debt_flag", False)),
         "cpap": cpap,
         "sleepnumber": sn,
+        "weather": wx,
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }

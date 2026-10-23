@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Capacity Planner — extra sleep sources (ResMed myAir CPAP + Sleep Number SleepIQ)
-================================================================================
+Capacity Planner — extra sources (ResMed myAir CPAP, Sleep Number SleepIQ, weather / barometric pain)
+======================================================================================================
 Standalone project (C:\\Users\\dppha\\CapacityPlanner). Not part of CrystalBull.
 
-Two optional feeds for garmin_capacity.py. Both are best-effort: every public call returns
+Three optional feeds for garmin_capacity.py. All are best-effort: every public call returns
 a dict or None, logs the failure (the scheduled tasks redirect stderr to data\\task.log) and
 NEVER raises into the morning run.
 
@@ -12,6 +12,19 @@ NEVER raises into the morning run.
                                myair_score, date} | None
     fetch_sleepnumber(day) -> {sleepiq_score, in_bed_min, restful_min, restless_min, out_of_bed_min,
                                avg_hr, avg_hrv, avg_rr, bed_entry, sleeper, date} | None
+    fetch_weather(day)     -> {pressure_hpa, trend_3h_hpa, d12_hpa, d12_window, d24_hpa, d24_window,
+                               pressure_min_hpa, pressure_max_hpa, pain_index, pain_level, temp_f,
+                               temp_high_f, humidity_pct, precip_prob_max_pct, condition, location,
+                               lat, lon, anchor, date} | None
+
+Weather (2026-10-23): Open-Meteo forecast API (free, no key) hourly pressure_msl for yesterday ->
+tomorrow at the configured location. Location: WEATHER_LAT / WEATHER_LON, else WEATHER_PLACE
+(e.g. "Frankfort, KY") geocoded once through Open-Meteo and cached in data\\.weather_location.json.
+Neither set -> the source is skipped with a WARNING. Barometric pain index: the largest pressure
+change over any 12 h window (and any 24 h window) spanning 12 h back to 24 h ahead of the anchor
+(08:30 wake, or the run time today). pain_level NONE / LOW / MODERATE / HIGH from the hPa
+thresholds in garmin_capacity.py (WEATHER_PAIN_*); pain_index 0-10 = 10 * max(|d12| / 8 hPa,
+|d24| / 12 hPa). The raw response is kept in data\\raw\\weather_<day>.json.
 
 myAir (NA): Okta classic authn -> optional e-mail MFA (interactive --setup-myair only) ->
 OAuth code + PKCE -> AppSync GraphQL (GetPatientSleepRecords). Ported 2026-10-23 from the
@@ -426,6 +439,163 @@ def setup_sleepiq() -> int:
     return 0
 
 
+# ───────────────────────────── Weather / barometric pressure (Open-Meteo) ─────────────────────────────
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_LOCATION_FILE = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data"))) / ".weather_location.json"
+WEATHER_RAW_DIR = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data"))) / "raw"
+WEATHER_ANCHOR_HM = "08:30"     # for a past --date: evaluate the pressure window from this wake time
+WEATHER_BACK_H = 12             # window span: this many hours before the anchor ...
+WEATHER_AHEAD_H = 24            # ... to this many hours after it (today's fronts count, tonight's too)
+WEATHER_D12_FULL_SCALE = 8.0    # pain_index 10 = a 12 h change of this many hPa ...
+WEATHER_D24_FULL_SCALE = 12.0   # ... or a 24 h change of this many hPa
+WMO_CODES = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog", 48: "rime fog",
+             51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "freezing drizzle",
+             61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+             71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains", 80: "rain showers",
+             81: "rain showers", 82: "violent showers", 85: "snow showers", 86: "snow showers",
+             95: "thunderstorm", 96: "thunderstorm w/ hail", 99: "thunderstorm w/ hail"}
+
+
+def weather_location() -> Optional[Dict[str, Any]]:
+    """WEATHER_LAT/WEATHER_LON win; else WEATHER_PLACE geocoded once (cached by place name)."""
+    lat, lon = os.getenv("WEATHER_LAT"), os.getenv("WEATHER_LON")
+    if lat and lon:
+        try:
+            return {"lat": float(lat), "lon": float(lon), "name": os.getenv("WEATHER_PLACE") or f"{lat},{lon}"}
+        except ValueError:
+            log.warning("weather: WEATHER_LAT/WEATHER_LON are not numbers (%r, %r)", lat, lon)
+            return None
+    place = (os.getenv("WEATHER_PLACE") or "").strip()
+    if not place:
+        log.warning("weather: set WEATHER_PLACE (e.g. 'Frankfort, KY') or WEATHER_LAT/WEATHER_LON in .env; skipped")
+        return None
+    cached = _read_json(WEATHER_LOCATION_FILE)
+    if cached.get("place") == place and cached.get("lat") is not None:
+        return cached
+    r = _session().get(OPEN_METEO_GEOCODE, params={"name": place.split(",")[0].strip(), "count": 10,
+                                                   "language": "en", "format": "json"}, timeout=HTTP_TIMEOUT)
+    results = r.json().get("results") or []
+    if not results:
+        raise RuntimeError(f"weather: geocoding found nothing for {place!r}")
+    want_admin = place.split(",")[1].strip().lower() if "," in place else ""
+    hit = next((x for x in results if want_admin and want_admin in
+                {str(x.get("admin1", "")).lower(), str(x.get("admin1_code", "")).lower(), str(x.get("country_code", "")).lower()}),
+               results[0])
+    loc = {"place": place, "lat": hit["latitude"], "lon": hit["longitude"],
+           "name": ", ".join(str(x) for x in (hit.get("name"), hit.get("admin1"), hit.get("country_code")) if x),
+           "timezone": hit.get("timezone"), "saved_at": datetime.now().isoformat(timespec="seconds")}
+    _write_json(WEATHER_LOCATION_FILE, loc)
+    log.info("weather: geocoded %r -> %s (%.4f, %.4f)", place, loc["name"], loc["lat"], loc["lon"])
+    return loc
+
+
+def _max_window_change(times: List[datetime], vals: List[float], hours: int, lo: datetime, hi: datetime):
+    """Signed change with the largest magnitude over any `hours`-long window whose ends lie in [lo, hi].
+    Returns (delta, start_time, end_time) or (None, None, None)."""
+    idx = {t: i for i, t in enumerate(times)}
+    best = (None, None, None)
+    for i, t0 in enumerate(times):
+        t1 = t0 + timedelta(hours=hours)
+        if t0 < lo or t1 > hi or t1 not in idx:
+            continue
+        v0, v1 = vals[i], vals[idx[t1]]
+        if v0 is None or v1 is None:
+            continue
+        d = v1 - v0
+        if best[0] is None or abs(d) > abs(best[0]):
+            best = (d, t0, t1)
+    return best
+
+
+def pain_from_pressure(d12: Optional[float], d24: Optional[float], moderate12: float, high12: float,
+                       moderate24: float, high24: float, low12: float) -> Dict[str, Any]:
+    """pain_index 0-10 (continuous) + pain_level from the hPa thresholds the caller passes in."""
+    a12, a24 = abs(d12 or 0.0), abs(d24 or 0.0)
+    index = round(min(10.0, 10.0 * max(a12 / WEATHER_D12_FULL_SCALE, a24 / WEATHER_D24_FULL_SCALE)), 1)
+    if a12 >= high12 or a24 >= high24:
+        level = "HIGH"
+    elif a12 >= moderate12 or a24 >= moderate24:
+        level = "MODERATE"
+    elif a12 >= low12:
+        level = "LOW"
+    else:
+        level = "NONE"
+    return {"pain_index": index, "pain_level": level}
+
+
+def fetch_weather(day: date, thresholds: Dict[str, float], at: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """Barometric-pressure pain factor for `day` (plus temperature / humidity / precip for the card).
+    `thresholds` = {"low12", "moderate12", "high12", "moderate24", "high24"} in hPa (garmin_capacity
+    WEATHER_PAIN_* constants). Returns None (and logs) on any failure, never raises."""
+    try:
+        loc = weather_location()
+        if loc is None:
+            return None
+        anchor = at or (datetime.now() if day == date.today() else
+                        datetime.combine(day, datetime.min.time()).replace(
+                            hour=int(WEATHER_ANCHOR_HM[:2]), minute=int(WEATHER_ANCHOR_HM[3:])))
+        anchor = anchor.replace(minute=0, second=0, microsecond=0)
+        past_days = max(1, (date.today() - day).days + 1)
+        r = _session().get(OPEN_METEO_FORECAST, params={
+            "latitude": loc["lat"], "longitude": loc["lon"],
+            "hourly": "pressure_msl,temperature_2m,relative_humidity_2m,precipitation_probability,weather_code",
+            "temperature_unit": "fahrenheit", "timezone": "auto", "past_days": past_days, "forecast_days": 3,
+        }, timeout=HTTP_TIMEOUT)
+        j = r.json()
+        if j.get("error"):
+            raise RuntimeError(f"Open-Meteo: {j.get('reason')}")
+        try:
+            WEATHER_RAW_DIR.mkdir(parents=True, exist_ok=True)
+            _write_json(WEATHER_RAW_DIR / f"weather_{day}.json", {"_meta": {"fetched_at": datetime.now().isoformat(timespec="seconds"),
+                                                                           "anchor": anchor.isoformat(), "location": loc}, **j})
+        except Exception as e:
+            log.warning("weather: raw save failed: %s", e)
+        h = j.get("hourly") or {}
+        times = [datetime.fromisoformat(t) for t in h.get("time") or []]
+        press = h.get("pressure_msl") or []
+        if not times or not press:
+            raise RuntimeError("Open-Meteo returned no hourly pressure")
+        lo, hi = anchor - timedelta(hours=WEATHER_BACK_H), anchor + timedelta(hours=WEATHER_AHEAD_H)
+        d12, s12, e12 = _max_window_change(times, press, 12, lo, hi)
+        d24, s24, e24 = _max_window_change(times, press, 24, lo, hi)
+        idx = {t: i for i, t in enumerate(times)}
+        i_now = idx.get(anchor)
+        if i_now is None:                       # anchor outside the returned span: nearest hour
+            i_now = min(range(len(times)), key=lambda i: abs((times[i] - anchor).total_seconds()))
+        p_now = press[i_now]
+        p_3h = press[i_now - 3] if i_now >= 3 else None
+        span = [i for i, t in enumerate(times) if lo <= t <= hi and press[i] is not None]
+        today_idx = [i for i, t in enumerate(times) if t.date() == day]
+        temps = h.get("temperature_2m") or []
+        pops = h.get("precipitation_probability") or []
+        codes = h.get("weather_code") or []
+        hums = h.get("relative_humidity_2m") or []
+        pain = pain_from_pressure(d12, d24, thresholds["moderate12"], thresholds["high12"],
+                                  thresholds["moderate24"], thresholds["high24"], thresholds["low12"])
+        rnd = lambda v: round(float(v), 1) if isinstance(v, (int, float)) else None
+        return {
+            "pressure_hpa": rnd(p_now),
+            "trend_3h_hpa": rnd(p_now - p_3h) if p_now is not None and p_3h is not None else None,
+            "d12_hpa": rnd(d12), "d12_window": [s12.isoformat(timespec="minutes"), e12.isoformat(timespec="minutes")] if s12 else None,
+            "d24_hpa": rnd(d24), "d24_window": [s24.isoformat(timespec="minutes"), e24.isoformat(timespec="minutes")] if s24 else None,
+            "pressure_min_hpa": rnd(min(press[i] for i in span)) if span else None,
+            "pressure_max_hpa": rnd(max(press[i] for i in span)) if span else None,
+            **pain,
+            "temp_f": rnd(temps[i_now]) if i_now < len(temps) else None,
+            "temp_high_f": rnd(max(temps[i] for i in today_idx if temps[i] is not None)) if today_idx and temps else None,
+            "humidity_pct": hums[i_now] if i_now < len(hums) else None,
+            "precip_prob_max_pct": max((pops[i] for i in today_idx if i < len(pops) and pops[i] is not None), default=None) if today_idx else None,
+            "condition": WMO_CODES.get(codes[i_now], str(codes[i_now])) if i_now < len(codes) else None,
+            "location": loc.get("name"), "lat": loc["lat"], "lon": loc["lon"],
+            "anchor": anchor.isoformat(timespec="minutes"),
+            "date": day.isoformat(),
+        }
+    except Exception as e:
+        log.warning("weather fetch failed: %s: %s", type(e).__name__, e)
+        return None
+
+
 def sleep_min_from_sleepnumber(sn: Optional[Dict[str, Any]]) -> Optional[int]:
     """Asleep estimate = in_bed - restless - out_of_bed (operator's rule, 2026-10-23)."""
     if not sn or sn.get("in_bed_min") is None:
@@ -444,3 +614,5 @@ if __name__ == "__main__":          # quick manual check: python sources_extra.p
     d = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date.today()
     print("cpap       :", json.dumps(fetch_cpap(d)))
     print("sleepnumber:", json.dumps(fetch_sleepnumber(d)))
+    print("weather    :", json.dumps(fetch_weather(d, {"low12": 1.5, "moderate12": 3.0, "high12": 6.0,
+                                                      "moderate24": 5.0, "high24": 10.0})))
