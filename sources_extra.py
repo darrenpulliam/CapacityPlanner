@@ -8,7 +8,8 @@ Two optional feeds for garmin_capacity.py. Both are best-effort: every public ca
 a dict or None, logs the failure (the scheduled tasks redirect stderr to data\\task.log) and
 NEVER raises into the morning run.
 
-    fetch_cpap(day)        -> {usage_min, ahi, leak_95, mask_score, myair_score, date} | None
+    fetch_cpap(day)        -> {usage_min, ahi, leak_95, mask_seal_score, mask_onoff_score, mask_pairs,
+                               myair_score, date} | None
     fetch_sleepnumber(day) -> {sleepiq_score, in_bed_min, restful_min, restless_min, out_of_bed_min,
                                avg_hr, avg_hrv, avg_rr, bed_entry, sleeper, date} | None
 
@@ -249,12 +250,18 @@ class MyAirClient:
 
 
 def _cpap_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """myAir score (sleepScore, 0-100) = usageScore (0-70) + maskScore (0-5, mask on/off)
+    + leakScore (0-20, mask seal) + ahiScore (0-5). Verified 2026-10-23 on raw records
+    (e.g. 70 + 4 + 16 + 5 = 95). Until this fix mask_score held maskScore (0-5) and was
+    compared against the 0-20 seal threshold, so the "mask seal" reason always fired."""
     f = lambda k: rec.get(k) if isinstance(rec.get(k), (int, float)) and not isinstance(rec.get(k), bool) else None
     return {
         "usage_min": int(f("totalUsage")) if f("totalUsage") is not None else None,
         "ahi": round(float(f("ahi")), 1) if f("ahi") is not None else None,
         "leak_95": round(float(f("leakPercentile")), 1) if f("leakPercentile") is not None else None,
-        "mask_score": f("maskScore"),
+        "mask_seal_score": f("leakScore"),      # 0-20 (seal); NOT maskScore — see note above
+        "mask_onoff_score": f("maskScore"),     # 0-5 (mask on/off events)
+        "mask_pairs": int(f("maskPairCount")) if f("maskPairCount") is not None else None,
         "myair_score": f("sleepScore"),
         "date": rec.get("startDate"),
     }

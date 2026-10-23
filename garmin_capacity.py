@@ -58,14 +58,22 @@ Usage (Python 3.12+):
   python garmin_capacity.py --setup-myair    # one-time ResMed myAir login (e-mail/password, e-mailed MFA code)
   python garmin_capacity.py --setup-sleepiq  # one-time Sleep Number login; picks Darren's side if 2 sleepers
 
-Extra sources (2026-10-23, sources_extra.py): ResMed myAir (CPAP usage, AHI, 95th-pct leak, mask
-score, myAir score) and Sleep Number SleepIQ (score, in-bed / restful / restless, HR, HRV, RR, bed
-entry). Both are optional: a failure logs a WARNING and the run continues with Garmin only.
+Extra sources (2026-10-23, sources_extra.py): ResMed myAir (CPAP usage, AHI, 95th-pct leak, mask seal
+score 0-20, mask on/off score 0-5 + count, myAir score) and Sleep Number SleepIQ (score, in-bed /
+restful / restless, HR, HRV, RR, bed entry). Both are optional: a failure logs a WARNING and the run
+continues with Garmin only.
 Rules: sleep_min falls back Garmin -> SleepIQ (in_bed - restless - out_of_bed) -> CPAP usage
 (metrics.sleep_source says which); SleepIQ score < SLEEP_SCORE_LOW only counts when Garmin has no
 sleep score; AHI >= CPAP_AHI_DOWNGRADE joins the one-tier downgrade (still max one tier total);
 AHI >= CPAP_AHI_ALERT adds "check mask/pressure"; CPAP usage < CPAP_MIN_USAGE_MIN sets the sleep-debt
-flag (-15 min bedtime, -45 cap unchanged); high leak / low mask score adds a "mask seal" reason only.
+flag (-15 min bedtime, -45 cap unchanged); leak_95 > CPAP_LEAK_HIGH_LPM or mask_seal_score <
+CPAP_MASK_SEAL_LOW adds a "mask seal" reason only.
+Watch not worn (2026-10-23): when Garmin has no sleep record for the night AND bb_charged_overnight
+== 0, the Body Battery at wake is stale (it just carries yesterday's drained value), so the base tier
+comes from the SleepIQ score instead (SLEEPIQ_GREEN_MIN / SLEEPIQ_YELLOW_MIN) and the normal one-tier
+downgrade OR still applies; metrics.tier_source = "garmin" | "sleepiq" says which. No SleepIQ either:
+unchanged (Body Battery as before). The "Actual bed vs target" reason was dropped the same day: its
+target was not shift-aware; the cloud calendar writer does that comparison from the calendar.
 Payload gains "cpap" and "sleepnumber" objects (null when missing); subject and JSON markers unchanged.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
@@ -110,7 +118,10 @@ CPAP_AHI_DOWNGRADE = 5.0       # AHI (events/h) at or above this joins the one-t
 CPAP_AHI_ALERT = 15.0          # AHI at or above this adds the "check mask/pressure" reason
 CPAP_MIN_USAGE_MIN = 240       # CPAP worn less than this (4 h) sets the sleep-debt flag (-15 min bedtime)
 CPAP_LEAK_HIGH_LPM = 24.0      # 95th-percentile leak (L/min) above this = "mask seal" reason (ResMed's high-leak line)
-CPAP_MASK_SCORE_LOW = 15       # myAir mask-seal score (0-20) below this = "mask seal" reason
+CPAP_MASK_SEAL_LOW = 15        # myAir mask SEAL score (GraphQL leakScore, 0-20) below this = "mask seal" reason
+                               #   (myAir score = usage 0-70 + mask on/off 0-5 + seal 0-20 + AHI 0-5)
+SLEEPIQ_GREEN_MIN = 80         # watch-not-worn fallback: SleepIQ score at/above this = GREEN base tier
+SLEEPIQ_YELLOW_MIN = 60        #   ... at/above this = YELLOW, below = RED (only when Garmin BB is untrusted)
 SLEEP_DEBT_SHIFT_MIN = 15      # extra bedtime pull when the sleep-debt flag is set (shared with the 3-night average)
 TIER_PLAN = {
     "GREEN":  {"deep_blocks": 3, "bedtime_shift": 0,   "guidance": "Full capacity. Front-load the hardest work; outings/events OK."},
@@ -364,6 +375,43 @@ def mock_raw(day: date) -> Dict[str, Any]:
     }
 
 
+# --mock scenarios: one per rule (python garmin_capacity.py --mock <name>; bare --mock = default).
+_NO_SLEEP_RAW = {   # watch not worn: no Garmin sleep record, Body Battery charged 0 overnight (10/23 shape)
+    "stats": {"bodyBatteryAtWakeTime": None, "bodyBatteryHighestValue": 5, "bodyBatteryMostRecentValue": 5,
+              "averageStressLevel": 58, "restingHeartRate": 73, "sleepingSeconds": 0},
+    "sleep": {"dailySleepDTO": {"sleepTimeSeconds": None, "sleepScores": {}}},
+    "hrv": None,
+    "body_battery": [{"charged": 0, "drained": 0, "bodyBatteryValuesArray": [[1792728000000, 5], [1792730520000, 5]]}],
+}
+MOCK_CASES = {
+    "default":          {},                                                       # BB 68 GREEN; AHI 6.3 -> YELLOW; usage 212 -> sleep-debt flag
+    "seal-score":       {"cpap": {"leak_95": 9.6, "mask_seal_score": 10}},        # mask seal via seal score < CPAP_MASK_SEAL_LOW
+    "seal-leak":        {"cpap": {"leak_95": 34.8, "mask_seal_score": 19}},       # mask seal via leak_95 > CPAP_LEAK_HIGH_LPM
+    "seal-ok":          {"cpap": {"leak_95": 9.6, "mask_seal_score": 19}},        # neither: no "mask seal" reason
+    "watch-off":        {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": {"sleepiq_score": 73}},   # tier from SleepIQ 73 -> YELLOW
+    "watch-off-green":  {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": {"sleepiq_score": 85}},   # SleepIQ 85 -> GREEN
+    "watch-off-red":    {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": {"sleepiq_score": 52}},   # SleepIQ 52 -> RED
+    "watch-off-ahi":    {"raw": _NO_SLEEP_RAW, "cpap": {"ahi": 5.0, "usage_min": 419, "leak_95": 34.8,
+                                                        "mask_seal_score": 10}, "sn": {"sleepiq_score": 73}},  # 10/23: SleepIQ YELLOW, AHI -> RED
+    "watch-off-nosiq":  {"raw": _NO_SLEEP_RAW, "cpap": None, "sn": None},                  # no SleepIQ: BB 5 -> RED as before
+}
+
+
+def mock_extra(day: date, case: str = "default"):
+    """Synthetic myAir / SleepIQ objects for --mock, overlaid with the scenario's overrides."""
+    cpap = {"usage_min": 212, "ahi": 6.3, "leak_95": 9.6, "mask_seal_score": 19, "mask_onoff_score": 4,
+            "mask_pairs": 3, "myair_score": 78, "date": str(day - timedelta(days=1))}
+    sn = {"sleepiq_score": 64, "in_bed_min": 431, "restful_min": 362, "restless_min": 55, "out_of_bed_min": 14,
+          "avg_hr": 61, "avg_hrv": 38, "avg_rr": 15, "bed_entry": f"{day - timedelta(days=1)}T23:58",
+          "bed_exit": f"{day}T07:35", "sleeper": "Darren", "sessions": 1, "date": str(day)}
+    c = MOCK_CASES[case]
+    if "cpap" in c:
+        cpap = None if c["cpap"] is None else {**cpap, **c["cpap"]}
+    if "sn" in c:
+        sn = None if c["sn"] is None else {**sn, **c["sn"]}
+    return cpap, sn
+
+
 # ───────────────────────────── metrics ─────────────────────────────
 def extract(raw: Dict[str, Any]) -> Dict[str, Any]:
     stats, sleep, hrv, bb, rd = (raw.get(k) for k in ("stats", "sleep", "hrv", "body_battery", "readiness"))
@@ -411,17 +459,6 @@ def merge_extra(m: Dict[str, Any], cpap: Optional[Dict[str, Any]], sn: Optional[
     return m
 
 
-def previous_bedtime_target(day: date) -> Optional[str]:
-    """Last night's bedtime target = yesterday's payload circadian.bedtime_target (data\\<day-1>.json)."""
-    f = DATA_DIR / f"{day - timedelta(days=1)}.json"
-    if not f.exists():
-        return None
-    try:
-        return dig(json.loads(f.read_text(encoding="utf-8")), "circadian", "bedtime_target")
-    except Exception:
-        return None
-
-
 def _hm(iso: Optional[str]) -> str:
     try:
         return datetime.fromisoformat(iso).strftime("%H:%M")
@@ -429,14 +466,30 @@ def _hm(iso: Optional[str]) -> str:
         return str(iso)
 
 
-def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None, sn: Optional[Dict[str, Any]] = None,
-             prev_target: Optional[str] = None) -> Dict[str, Any]:
+def bb_untrusted(m: Dict[str, Any]) -> bool:
+    """Watch not worn overnight: Garmin has no sleep record for the night (sleep_source is not
+    "garmin", see merge_extra) AND Body Battery charged 0 overnight, so bb_wake is yesterday's
+    stale drained value, not a measurement of recovery."""
+    return m.get("sleep_source") != "garmin" and m.get("bb_charged_overnight") == 0
+
+
+def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None,
+             sn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Tier + reasons. Sets m["tier_source"] ("garmin" | "sleepiq" | None for UNKNOWN)."""
     bb = m.get("bb_wake")
     reasons: List[str] = []
+    m["tier_source"] = None
     if bb is None:
         return {"tier": "UNKNOWN", "reasons": ["No Body Battery reading — watch not synced?"], "sleep_debt_flag": False}
-    tier = "GREEN" if bb >= GREEN_MIN else "YELLOW" if bb >= YELLOW_MIN else "RED"
-    reasons.append(f"Body Battery at wake {bb}")
+    siq = sn.get("sleepiq_score") if sn else None
+    if bb_untrusted(m) and siq is not None:
+        tier = "GREEN" if siq >= SLEEPIQ_GREEN_MIN else "YELLOW" if siq >= SLEEPIQ_YELLOW_MIN else "RED"
+        m["tier_source"] = "sleepiq"
+        reasons.append(f"BB untrusted (no Garmin sleep) — tier from SleepIQ {siq}")
+    else:
+        tier = "GREEN" if bb >= GREEN_MIN else "YELLOW" if bb >= YELLOW_MIN else "RED"
+        m["tier_source"] = "garmin"
+        reasons.append(f"Body Battery at wake {bb}")
 
     downgrade = []
     if m.get("sleep_score") is not None:
@@ -461,11 +514,9 @@ def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None, sn: Optio
         if usage is not None and usage < CPAP_MIN_USAGE_MIN:
             sleep_debt_flag = True
             reasons.append(f"CPAP worn {usage} min (< {CPAP_MIN_USAGE_MIN}): sleep-debt flag")
-        leak, mask = cpap.get("leak_95"), cpap.get("mask_score")
-        if (leak is not None and leak > CPAP_LEAK_HIGH_LPM) or (mask is not None and mask < CPAP_MASK_SCORE_LOW):
-            reasons.append(f"mask seal (leak {leak} L/min, mask score {mask})")
-    if sn and sn.get("bed_entry"):
-        reasons.append(f"Actual bed {_hm(sn['bed_entry'])} vs target {_hm(prev_target) if prev_target else 'n/a'}")
+        leak, seal = cpap.get("leak_95"), cpap.get("mask_seal_score")
+        if (leak is not None and leak > CPAP_LEAK_HIGH_LPM) or (seal is not None and seal < CPAP_MASK_SEAL_LOW):
+            reasons.append(f"mask seal (leak {leak} L/min, seal score {seal}/20)")
     return {"tier": tier, "reasons": reasons, "sleep_debt_flag": sleep_debt_flag}
 
 
@@ -564,7 +615,8 @@ def cpap_line(c: Optional[Dict[str, Any]]) -> str:
     u = c.get("usage_min")
     usage = f"{u//60}h{u%60:02d}" if isinstance(u, int) else "n/a"
     return (f"CPAP {usage}  |  AHI {c.get('ahi')}  |  leak95 {c.get('leak_95')} L/min  |  "
-            f"mask {c.get('mask_score')}/20  |  myAir {c.get('myair_score')}")
+            f"seal {c.get('mask_seal_score')}/20  |  mask on/off {c.get('mask_onoff_score')}/5 "
+            f"({c.get('mask_pairs')}x)  |  myAir {c.get('myair_score')}")
 
 
 def sleepnumber_line(s: Optional[Dict[str, Any]]) -> str:
@@ -796,7 +848,8 @@ def main() -> int:
     ap.add_argument("--setup", action="store_true", help="interactive first login (stores tokens)")
     ap.add_argument("--date", help="YYYY-MM-DD (default today)")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--mock", nargs="?", const="default", choices=sorted(MOCK_CASES),
+                    help="no Garmin call; synthetic data (optional scenario: " + ", ".join(sorted(MOCK_CASES)) + ")")
     ap.add_argument("--refresh", action="store_true", help=f"ignore the <{CACHE_MAX_AGE_H} h raw cache and hit Garmin")
     ap.add_argument("--if-missing", action="store_true", help="retry run: skip if today already published with data")
     ap.add_argument("--now", action="store_true",
@@ -837,6 +890,7 @@ def main() -> int:
 
     if a.mock:
         raw = mock_raw(day)
+        raw.update(MOCK_CASES[a.mock].get("raw", {}))
     else:
         raw = None if a.refresh else cached_raw(day)
         if raw is None:
@@ -848,11 +902,7 @@ def main() -> int:
     metrics = extract(raw)
     cpap = sn = None
     if a.mock:
-        cpap = {"usage_min": 212, "ahi": 6.3, "leak_95": 9.6, "mask_score": 19, "myair_score": 78,
-                "date": str(day - timedelta(days=1))}
-        sn = {"sleepiq_score": 64, "in_bed_min": 431, "restful_min": 362, "restless_min": 55, "out_of_bed_min": 14,
-              "avg_hr": 61, "avg_hrv": 38, "avg_rr": 15, "bed_entry": f"{day - timedelta(days=1)}T23:58",
-              "sleeper": "Darren", "date": str(day)}
+        cpap, sn = mock_extra(day, a.mock)
     elif not a.no_extra:
         try:   # both fetches are best-effort inside sources_extra; this guard covers an import error too
             import sources_extra
@@ -861,7 +911,7 @@ def main() -> int:
         except Exception as e:
             log.warning("extra sources skipped: %s: %s", type(e).__name__, e)
     metrics = merge_extra(metrics, cpap, sn)
-    cls = classify(metrics, cpap, sn, previous_bedtime_target(day))
+    cls = classify(metrics, cpap, sn)
     tier = cls["tier"]
     payload = {
         "date": str(day),
@@ -882,6 +932,7 @@ def main() -> int:
     if not a.mock:
         save(day, payload, raw)
     if a.dry_run or a.mock:
+        print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")   # what the mail would carry
         return 0
 
     tg = send_telegram(text)
