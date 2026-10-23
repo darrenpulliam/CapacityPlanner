@@ -55,8 +55,20 @@ Usage (Python 3.12+):
   python garmin_capacity.py --date 2026-10-06
   python garmin_capacity.py --now          # current readings -> Telegram + [CAPACITY-NOW] mail
   python garmin_capacity.py --now --dry-run
+  python garmin_capacity.py --setup-myair    # one-time ResMed myAir login (e-mail/password, e-mailed MFA code)
+  python garmin_capacity.py --setup-sleepiq  # one-time Sleep Number login; picks Darren's side if 2 sleepers
 
-Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests
+Extra sources (2026-10-23, sources_extra.py): ResMed myAir (CPAP usage, AHI, 95th-pct leak, mask
+score, myAir score) and Sleep Number SleepIQ (score, in-bed / restful / restless, HR, HRV, RR, bed
+entry). Both are optional: a failure logs a WARNING and the run continues with Garmin only.
+Rules: sleep_min falls back Garmin -> SleepIQ (in_bed - restless - out_of_bed) -> CPAP usage
+(metrics.sleep_source says which); SleepIQ score < SLEEP_SCORE_LOW only counts when Garmin has no
+sleep score; AHI >= CPAP_AHI_DOWNGRADE joins the one-tier downgrade (still max one tier total);
+AHI >= CPAP_AHI_ALERT adds "check mask/pressure"; CPAP usage < CPAP_MIN_USAGE_MIN sets the sleep-debt
+flag (-15 min bedtime, -45 cap unchanged); high leak / low mask score adds a "mask seal" reason only.
+Payload gains "cpap" and "sleepnumber" objects (null when missing); subject and JSON markers unchanged.
+
+Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
 from __future__ import annotations
 
@@ -90,7 +102,16 @@ MAX_PULL_EARLIER_MIN = 45      # bedtime never moves more than this earlier
 GREEN_MIN = 50                 # recalibrated 2026-10-07 from 12-mo Garmin history (median wake BB ~35)
 YELLOW_MIN = 25
 BAD_HRV = {"UNBALANCED", "LOW", "POOR"}
+SLEEP_SCORE_LOW = 60           # sleep score below this joins the one-tier downgrade (Garmin, else SleepIQ)
 TIER_ORDER = ["RED", "YELLOW", "GREEN"]
+
+# Extra sources (2026-10-23): ResMed myAir CPAP + Sleep Number SleepIQ thresholds
+CPAP_AHI_DOWNGRADE = 5.0       # AHI (events/h) at or above this joins the one-tier downgrade
+CPAP_AHI_ALERT = 15.0          # AHI at or above this adds the "check mask/pressure" reason
+CPAP_MIN_USAGE_MIN = 240       # CPAP worn less than this (4 h) sets the sleep-debt flag (-15 min bedtime)
+CPAP_LEAK_HIGH_LPM = 24.0      # 95th-percentile leak (L/min) above this = "mask seal" reason (ResMed's high-leak line)
+CPAP_MASK_SCORE_LOW = 15       # myAir mask-seal score (0-20) below this = "mask seal" reason
+SLEEP_DEBT_SHIFT_MIN = 15      # extra bedtime pull when the sleep-debt flag is set (shared with the 3-night average)
 TIER_PLAN = {
     "GREEN":  {"deep_blocks": 3, "bedtime_shift": 0,   "guidance": "Full capacity. Front-load the hardest work; outings/events OK."},
     "YELLOW": {"deep_blocks": 2, "bedtime_shift": -15, "guidance": "Moderate. Two deep blocks max, protect the afternoon dip, no new commitments after 6 PM."},
@@ -375,23 +396,77 @@ def extract(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def classify(m: Dict[str, Any]) -> Dict[str, Any]:
+def merge_extra(m: Dict[str, Any], cpap: Optional[Dict[str, Any]], sn: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """sleep_min fallback chain Garmin -> SleepIQ (in_bed - restless - out_of_bed) -> CPAP usage,
+    recorded in metrics.sleep_source. Garmin fields are never overwritten."""
+    from sources_extra import sleep_min_from_sleepnumber
+    if m.get("sleep_min"):
+        m["sleep_source"] = "garmin"
+    elif sleep_min_from_sleepnumber(sn):
+        m["sleep_min"], m["sleep_source"] = sleep_min_from_sleepnumber(sn), "sleepiq"
+    elif cpap and cpap.get("usage_min"):
+        m["sleep_min"], m["sleep_source"] = int(cpap["usage_min"]), "cpap"
+    else:
+        m["sleep_source"] = None
+    return m
+
+
+def previous_bedtime_target(day: date) -> Optional[str]:
+    """Last night's bedtime target = yesterday's payload circadian.bedtime_target (data\\<day-1>.json)."""
+    f = DATA_DIR / f"{day - timedelta(days=1)}.json"
+    if not f.exists():
+        return None
+    try:
+        return dig(json.loads(f.read_text(encoding="utf-8")), "circadian", "bedtime_target")
+    except Exception:
+        return None
+
+
+def _hm(iso: Optional[str]) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%H:%M")
+    except Exception:
+        return str(iso)
+
+
+def classify(m: Dict[str, Any], cpap: Optional[Dict[str, Any]] = None, sn: Optional[Dict[str, Any]] = None,
+             prev_target: Optional[str] = None) -> Dict[str, Any]:
     bb = m.get("bb_wake")
     reasons: List[str] = []
     if bb is None:
-        return {"tier": "UNKNOWN", "reasons": ["No Body Battery reading — watch not synced?"]}
+        return {"tier": "UNKNOWN", "reasons": ["No Body Battery reading — watch not synced?"], "sleep_debt_flag": False}
     tier = "GREEN" if bb >= GREEN_MIN else "YELLOW" if bb >= YELLOW_MIN else "RED"
     reasons.append(f"Body Battery at wake {bb}")
 
     downgrade = []
-    if m.get("sleep_score") is not None and m["sleep_score"] < 60:
-        downgrade.append(f"sleep score {m['sleep_score']}")
+    if m.get("sleep_score") is not None:
+        if m["sleep_score"] < SLEEP_SCORE_LOW:
+            downgrade.append(f"sleep score {m['sleep_score']}")
+    elif sn and sn.get("sleepiq_score") is not None and sn["sleepiq_score"] < SLEEP_SCORE_LOW:
+        downgrade.append(f"SleepIQ score {sn['sleepiq_score']} (no Garmin sleep score)")   # SleepIQ stands in only when Garmin is silent
     if m.get("hrv_status") in BAD_HRV:
         downgrade.append(f"HRV {m['hrv_status'].lower()}")
+    ahi = cpap.get("ahi") if cpap else None
+    if ahi is not None and ahi >= CPAP_AHI_DOWNGRADE:
+        downgrade.append(f"AHI {ahi}")
     if downgrade and tier != "RED":
-        tier = TIER_ORDER[TIER_ORDER.index(tier) - 1]
+        tier = TIER_ORDER[TIER_ORDER.index(tier) - 1]      # OR of all flags: still exactly one tier
         reasons.append("downgraded one tier: " + ", ".join(downgrade))
-    return {"tier": tier, "reasons": reasons}
+
+    sleep_debt_flag = False
+    if cpap:
+        if ahi is not None and ahi >= CPAP_AHI_ALERT:
+            reasons.append(f"AHI {ahi} — check mask/pressure")
+        usage = cpap.get("usage_min")
+        if usage is not None and usage < CPAP_MIN_USAGE_MIN:
+            sleep_debt_flag = True
+            reasons.append(f"CPAP worn {usage} min (< {CPAP_MIN_USAGE_MIN}): sleep-debt flag")
+        leak, mask = cpap.get("leak_95"), cpap.get("mask_score")
+        if (leak is not None and leak > CPAP_LEAK_HIGH_LPM) or (mask is not None and mask < CPAP_MASK_SCORE_LOW):
+            reasons.append(f"mask seal (leak {leak} L/min, mask score {mask})")
+    if sn and sn.get("bed_entry"):
+        reasons.append(f"Actual bed {_hm(sn['bed_entry'])} vs target {_hm(prev_target) if prev_target else 'n/a'}")
+    return {"tier": tier, "reasons": reasons, "sleep_debt_flag": sleep_debt_flag}
 
 
 def recent_sleep(day: date, nights: int = 3) -> List[int]:
@@ -404,8 +479,9 @@ def recent_sleep(day: date, nights: int = 3) -> List[int]:
     return vals[-(nights - 1):]
 
 
-def circadian(day: date, tier: str, m: Dict[str, Any]) -> Dict[str, Any]:
-    """Tonight's bedtime + tomorrow's wake. Wake is fixed; only bedtime flexes earlier."""
+def circadian(day: date, tier: str, m: Dict[str, Any], sleep_debt_flag: bool = False) -> Dict[str, Any]:
+    """Tonight's bedtime + tomorrow's wake. Wake is fixed; only bedtime flexes earlier.
+    sleep_debt_flag (CPAP usage < CPAP_MIN_USAGE_MIN) adds the same -15 min the 3-night average does."""
     tomorrow = day + timedelta(days=1)
     wake = hm_to_dt(tomorrow, WAKE_ANCHOR)
     base_bed = wake - timedelta(minutes=SLEEP_NEED_MIN + SLEEP_LATENCY_MIN)
@@ -419,8 +495,11 @@ def circadian(day: date, tier: str, m: Dict[str, Any]) -> Dict[str, Any]:
     if len(last) >= 2:
         avg = sum(last) / len(last)
         if avg < SLEEP_NEED_MIN - 45:
-            shift -= 15
-            notes.append(f"sleep debt (avg {avg/60:.1f} h over {len(last)} nights): extra 15 min")
+            shift -= SLEEP_DEBT_SHIFT_MIN
+            notes.append(f"sleep debt (avg {avg/60:.1f} h over {len(last)} nights): extra {SLEEP_DEBT_SHIFT_MIN} min")
+    if sleep_debt_flag:
+        shift -= SLEEP_DEBT_SHIFT_MIN
+        notes.append(f"CPAP under {CPAP_MIN_USAGE_MIN} min: extra {SLEEP_DEBT_SHIFT_MIN} min")
     shift = max(shift, -MAX_PULL_EARLIER_MIN)
 
     bed = base_bed + timedelta(minutes=shift)
@@ -464,16 +543,38 @@ def card(payload: Dict[str, Any]) -> str:
     icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(payload["tier"], "⚪")
     t = lambda s: datetime.fromisoformat(s).strftime("%-I:%M %p") if os.name != "nt" else datetime.fromisoformat(s).strftime("%#I:%M %p")
     sleep = f"{m['sleep_min']//60}h{m['sleep_min']%60:02d}" if m.get("sleep_min") else "n/a"
+    src = f", {m['sleep_source']}" if m.get("sleep_source") and m.get("sleep_source") != "garmin" else ""
     return (
         f"{icon} CAPACITY {payload['tier']} — {payload['date']}\n"
-        f"Body Battery at wake: {m.get('bb_wake')}  |  Sleep {sleep} (score {m.get('sleep_score')})\n"
+        f"Body Battery at wake: {m.get('bb_wake')}  |  Sleep {sleep} (score {m.get('sleep_score')}{src})\n"
         f"HRV {m.get('hrv_last_night')} ({m.get('hrv_status')})  |  RHR {m.get('resting_hr')}  |  Readiness {m.get('readiness_score')}\n"
+        f"{cpap_line(payload.get('cpap'))}\n"
+        f"{sleepnumber_line(payload.get('sleepnumber'))}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
         f"{payload['plan'].get('guidance', '')}\n"
         f"Caffeine cutoff {t(c['caffeine_cutoff'])} · Wind-down {t(c['wind_down_start'])} · "
         f"Bed {t(c['bedtime_target'])} · Wake {t(c['wake_target'])}\n"
         f"({'; '.join(c['notes'])})"
     )
+
+
+def cpap_line(c: Optional[Dict[str, Any]]) -> str:
+    if not c:
+        return "CPAP: no data"
+    u = c.get("usage_min")
+    usage = f"{u//60}h{u%60:02d}" if isinstance(u, int) else "n/a"
+    return (f"CPAP {usage}  |  AHI {c.get('ahi')}  |  leak95 {c.get('leak_95')} L/min  |  "
+            f"mask {c.get('mask_score')}/20  |  myAir {c.get('myair_score')}")
+
+
+def sleepnumber_line(s: Optional[Dict[str, Any]]) -> str:
+    if not s:
+        return "SleepIQ: no data"
+    ib = s.get("in_bed_min")
+    in_bed = f"{ib//60}h{ib%60:02d}" if isinstance(ib, int) else "n/a"
+    return (f"SleepIQ {s.get('sleepiq_score')}  |  in bed {in_bed} (restful {s.get('restful_min')} / "
+            f"restless {s.get('restless_min')} min)  |  HR {s.get('avg_hr')}  |  HRV {s.get('avg_hrv')}  |  "
+            f"RR {s.get('avg_rr')}  |  bed {_hm(s.get('bed_entry'))}")
 
 
 def send_telegram(text: str) -> bool:
@@ -701,11 +802,23 @@ def main() -> int:
     ap.add_argument("--now", action="store_true",
                     help="on-demand current readings -> Telegram + [CAPACITY-NOW] mail (ignores the raw cache; "
                          "--dry-run prints only; --mock/--if-missing/--refresh don't apply)")
+    ap.add_argument("--setup-myair", action="store_true", help="interactive ResMed myAir login (e-mail MFA), saves tokens")
+    ap.add_argument("--setup-sleepiq", action="store_true", help="interactive Sleep Number login, picks the sleeper")
+    ap.add_argument("--no-extra", action="store_true", help="skip the myAir / SleepIQ fetch (Garmin only)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_env()
     day = date.fromisoformat(a.date) if a.date else date.today()
+
+    if a.setup_myair or a.setup_sleepiq:
+        import sources_extra
+        rc = 0
+        if a.setup_myair:
+            rc |= sources_extra.setup_myair()
+        if a.setup_sleepiq:
+            rc |= sources_extra.setup_sleepiq()
+        return rc
 
     if a.now:
         return run_now(day, a.dry_run)
@@ -733,7 +846,22 @@ def main() -> int:
                 log.error("Garmin fetch failed, nothing published: %s", e)
                 return 2
     metrics = extract(raw)
-    cls = classify(metrics)
+    cpap = sn = None
+    if a.mock:
+        cpap = {"usage_min": 212, "ahi": 6.3, "leak_95": 9.6, "mask_score": 19, "myair_score": 78,
+                "date": str(day - timedelta(days=1))}
+        sn = {"sleepiq_score": 64, "in_bed_min": 431, "restful_min": 362, "restless_min": 55, "out_of_bed_min": 14,
+              "avg_hr": 61, "avg_hrv": 38, "avg_rr": 15, "bed_entry": f"{day - timedelta(days=1)}T23:58",
+              "sleeper": "Darren", "date": str(day)}
+    elif not a.no_extra:
+        try:   # both fetches are best-effort inside sources_extra; this guard covers an import error too
+            import sources_extra
+            cpap = sources_extra.fetch_cpap(day)
+            sn = sources_extra.fetch_sleepnumber(day)
+        except Exception as e:
+            log.warning("extra sources skipped: %s: %s", type(e).__name__, e)
+    metrics = merge_extra(metrics, cpap, sn)
+    cls = classify(metrics, cpap, sn, previous_bedtime_target(day))
     tier = cls["tier"]
     payload = {
         "date": str(day),
@@ -742,7 +870,9 @@ def main() -> int:
         "reasons": cls["reasons"],
         "metrics": metrics,
         "plan": TIER_PLAN.get(tier, {"deep_blocks": 2, "guidance": "No data — plan as YELLOW until the watch syncs."}),
-        "circadian": circadian(day, tier, metrics),
+        "circadian": circadian(day, tier, metrics, cls.get("sleep_debt_flag", False)),
+        "cpap": cpap,
+        "sleepnumber": sn,
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
