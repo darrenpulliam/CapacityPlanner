@@ -92,6 +92,16 @@ Record-only fields (2026-10-23, for the capacity review; they never change tier 
   alcohol_drinks (appended; existing columns untouched). bedtime_target in history.csv is this
   script's fixed-wake anchor and is NOT shift-aware; the shift-aware targets are the calendar's
   bedtime / wake events. backfill_sleep_history.py fills data\\history_backfill.csv for the last year.
+Overnight fluid loss (2026-10-25, display only): Garmin Index scale weigh-ins via get_weigh_ins(yesterday,
+  today) -> raw["weigh_ins_range"] (dailyWeightSummaries[].allWeightMetrics[]; weight in GRAMS,
+  timestampGMT = epoch ms UTC -> converted to OVERNIGHT_TZ; the record's "date" field is a wall-clock value
+  in another zone and is ignored). pm = LAST weigh-in 19:00 yesterday - 04:00 today (after the last pee),
+  am = FIRST weigh-in 04:00 - 12:00 today (after the first pee). payload.overnight = {pm_weight_lb, pm_time,
+  am_weight_lb, am_time, delta_lb (pm - am, positive = lost), delta_ml_est (delta_lb * 453.6, nearest 10),
+  hours_between, missing "pm" | "am" | null}; null when both are missing or the scale call failed. Card
+  line "Overnight: 245.2 → 242.8 lb = −2.4 lb (~1090 mL, 8.6 h)". Garmin's API returns only weigh-ins
+  assigned to this profile, so a reading left unassigned on a shared scale is invisible here. Never
+  changes tier / bedtime / blocks; a scale error logs a WARNING and sets overnight to null.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -143,6 +153,14 @@ CPAP_MASK_SEAL_LOW = 15        # myAir mask SEAL score (GraphQL leakScore, 0-20)
 SLEEPIQ_GREEN_MIN = 80         # watch-not-worn fallback: SleepIQ score at/above this = GREEN base tier
 SLEEPIQ_YELLOW_MIN = 60        #   ... at/above this = YELLOW, below = RED (only when Garmin BB is untrusted)
 SLEEP_DEBT_SHIFT_MIN = 15      # extra bedtime pull when the sleep-debt flag is set (shared with the 3-night average)
+
+# Overnight fluid loss (2026-10-25): Garmin Index scale, bedtime weigh-in vs first morning weigh-in. Display only.
+OVERNIGHT_PM_FROM_H = 19       # bedtime window: 19:00 yesterday ...
+OVERNIGHT_PM_TO_H = 4          #   ... to 04:00 today; the LAST weigh-in in it is "pm"
+OVERNIGHT_AM_TO_H = 12         # morning window: 04:00 - 12:00 today; the FIRST weigh-in in it is "am"
+OVERNIGHT_TZ = "America/New_York"   # weigh-in timestampGMT (epoch ms, UTC) is converted to this zone (ET)
+G_PER_LB = 453.592             # Garmin weight field is grams (probe 2026-10-25: 93599.0 g = 206.4 lb)
+ML_PER_LB = 453.6              # 1 lb of water ~ 453.6 mL: delta_ml_est = delta_lb * ML_PER_LB, nearest 10
 
 # Weather / barometric pain (2026-10-23): |pressure change| over the worst 12 h / 24 h window, in hPa.
 # Migraine / joint-pain literature puts the trigger zone at roughly 5-10 hPa; a frontal passage is 6-12.
@@ -375,6 +393,7 @@ def pull_garmin(day: date, interactive: bool = False) -> Dict[str, Any]:
         "rhr": safe_call(c.get_rhr_day, d),
         "body_composition": safe_call(c.get_body_composition, d, d),
         "weigh_ins": safe_call(c.get_daily_weigh_ins, d),
+        "weigh_ins_range": safe_call(c.get_weigh_ins, (day - timedelta(days=1)).isoformat(), d),   # overnight delta
         "hydration": safe_call(c.get_hydration_data, d),
     }
 
@@ -448,7 +467,36 @@ MOCK_CASES = {
     "timing-null":      {"sn": None},                                                                         # neither -> nulls, "no timing" line
     "alcohol-logged":   {"alcohol": 2},                                                                       # metrics.alcohol_drinks 2 -> "Alcohol last night: 2"
     "alcohol-none":     {"alcohol": None},                                                                    # not logged -> null, never 0
+    # overnight weigh-in delta (display only; Garmin Index scale, grams + timestampGMT): tier / bedtime unchanged
+    "overnight":         {"overnight": {"pm": 245.2, "am": 242.8}},                                           # both: -2.4 lb (~1090 mL, 8.6 h)
+    "overnight-pm-only": {"overnight": {"pm": 245.2}},                                                        # no morning weigh-in: missing "am"
+    "overnight-am-only": {"overnight": {"am": 242.8}},                                                        # no bedtime weigh-in: missing "pm"
+    "overnight-none":    {"overnight": {}},                                                                   # scale unused: overnight null
 }
+
+
+def mock_weigh_ins(day: date, pm: Optional[float] = None, am: Optional[float] = None) -> Dict[str, Any]:
+    """Garmin get_weigh_ins shape for --mock: grams + timestampGMT (UTC ms) built from ET wall-clock times
+    (bed 23:35 yesterday, morning 08:11 today -> 8.6 h)."""
+    from datetime import timezone
+
+    def rec(local: datetime, lb: float) -> Dict[str, Any]:
+        try:
+            from zoneinfo import ZoneInfo
+            utc = local.replace(tzinfo=ZoneInfo(OVERNIGHT_TZ)).astimezone(timezone.utc)
+        except Exception:
+            utc = local.astimezone(timezone.utc)
+        return {"samplePk": int(utc.timestamp() * 1000) + 7, "weight": round(lb * G_PER_LB, 1), "sourceType": "INDEX_SCALE",
+                "timestampGMT": int(utc.timestamp() * 1000), "calendarDate": str(local.date()), "weightDelta": None}
+
+    days = {}
+    if pm is not None:
+        days.setdefault(str(day - timedelta(days=1)), []).append(rec(hm_to_dt(day - timedelta(days=1), "23:35"), pm))
+    if am is not None:
+        days.setdefault(str(day), []).append(rec(hm_to_dt(day, "08:11"), am))
+    return {"dailyWeightSummaries": [{"summaryDate": d, "numOfWeightEntries": len(v), "latestWeight": v[-1], "allWeightMetrics": v}
+                                     for d, v in sorted(days.items())],
+            "totalAverage": {}, "previousDateWeight": None, "nextDateWeight": None}
 
 
 def mock_weather(day: date, d12: float = -0.8, d24: float = 1.2) -> Dict[str, Any]:
@@ -580,6 +628,86 @@ def alcohol_for_night(night: date) -> Optional[float]:
         return val
     except Exception as e:
         log.warning("alcohol log unreadable: %s: %s", type(e).__name__, e)
+        return None
+
+
+def _gmt_ms_to_et(ms) -> Optional[datetime]:
+    """Garmin weigh-in timestampGMT (epoch ms, UTC) -> naive local time in OVERNIGHT_TZ (ET)."""
+    try:
+        from datetime import timezone
+        utc = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            return utc.astimezone(ZoneInfo(OVERNIGHT_TZ)).replace(tzinfo=None)
+        except Exception:
+            return utc.astimezone().replace(tzinfo=None)       # no tzdata: machine zone (this PC is ET)
+    except Exception:
+        return None
+
+
+def weigh_ins(raw: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every scale reading in the raw pull as {at (naive ET datetime), weight_lb, source, pk}, oldest first.
+    Reads raw["weigh_ins_range"] (get_weigh_ins: dailyWeightSummaries[].allWeightMetrics[]) and, for older
+    raw files, raw["weigh_ins"] / raw["body_composition"] (dateWeightList[]). Weight is grams; the time is
+    timestampGMT (UTC ms) — the record's "date" field is a wall clock in another zone and is not used."""
+    recs: List[Dict[str, Any]] = []
+    for key in ("weigh_ins_range", "weigh_ins", "body_composition"):
+        w = (raw or {}).get(key)
+        if isinstance(w, dict):
+            for summ in w.get("dailyWeightSummaries") or []:
+                recs.extend(summ.get("allWeightMetrics") or [])
+            recs.extend(w.get("dateWeightList") or [])
+        elif isinstance(w, list):
+            recs.extend(w)
+    out, seen = [], set()
+    for r in recs:
+        if not isinstance(r, dict) or r.get("weight") is None:
+            continue
+        at = _gmt_ms_to_et(r.get("timestampGMT"))
+        key = (r.get("samplePk"), r.get("timestampGMT"))
+        if at is None or key in seen:
+            continue
+        seen.add(key)
+        out.append({"at": at, "weight_lb": round(float(r["weight"]) / G_PER_LB, 1),
+                    "source": r.get("sourceType"), "pk": r.get("samplePk")})
+    out.sort(key=lambda x: x["at"])
+    return out
+
+
+def overnight_delta(raw: Optional[Dict[str, Any]], day: date) -> Optional[Dict[str, Any]]:
+    """Display only: bedtime weigh-in (LAST one 19:00 yesterday - 04:00 today) vs morning weigh-in (FIRST one
+    04:00 - 12:00 today) from the Garmin Index scale. None when both are missing or the scale data failed;
+    with one side missing the object is returned with `missing` = "pm" | "am". Never raises.
+    Garmin's API only returns weigh-ins assigned to this profile: a reading left unassigned on a shared
+    scale (or claimed by another profile) is not visible here, so a missing side may be an assignment issue."""
+    try:
+        wi = weigh_ins(raw)
+        pm_from = hm_to_dt(day - timedelta(days=1), f"{OVERNIGHT_PM_FROM_H:02d}:00")
+        pm_to = hm_to_dt(day, f"{OVERNIGHT_PM_TO_H:02d}:00")
+        am_to = hm_to_dt(day, f"{OVERNIGHT_AM_TO_H:02d}:00")
+        pm_all = [x for x in wi if pm_from <= x["at"] < pm_to]
+        am_all = [x for x in wi if pm_to <= x["at"] < am_to]
+        if len(wi) - len(pm_all) - len(am_all):
+            log.info("overnight: %d weigh-in(s) outside the bedtime / morning windows ignored",
+                     len(wi) - len(pm_all) - len(am_all))
+        pm, am = (pm_all[-1] if pm_all else None), (am_all[0] if am_all else None)
+        if pm is None and am is None:
+            log.info("overnight: no weigh-ins for %s (none assigned to this profile in the window)", day)
+            return None
+        iso = lambda x: x["at"].isoformat(timespec="minutes") if x else None
+        out = {"pm_weight_lb": pm["weight_lb"] if pm else None, "pm_time": iso(pm),
+               "am_weight_lb": am["weight_lb"] if am else None, "am_time": iso(am),
+               "delta_lb": None, "delta_ml_est": None, "hours_between": None,
+               "missing": "pm" if pm is None else "am" if am is None else None}
+        if pm and am:
+            out["delta_lb"] = round(pm["weight_lb"] - am["weight_lb"], 1)              # positive = weight lost overnight
+            out["delta_ml_est"] = int(round(out["delta_lb"] * ML_PER_LB / 10.0) * 10)
+            out["hours_between"] = round((am["at"] - pm["at"]).total_seconds() / 3600, 1)
+        else:
+            log.info("overnight: missing %s weigh-in (unassigned scale readings are not returned by Garmin)", out["missing"])
+        return out
+    except Exception as e:
+        log.warning("overnight weigh-in delta skipped: %s: %s", type(e).__name__, e)
         return None
 
 
@@ -767,6 +895,7 @@ def card(payload: Dict[str, Any]) -> str:
         f"{weather_line(payload.get('weather'))}\n"
         f"{slept_line(m)}\n"
         f"{alcohol_line(m)}\n"
+        f"{overnight_line(payload.get('overnight'))}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
         f"{payload['plan'].get('guidance', '')}\n"
         f"Caffeine cutoff {t(c['caffeine_cutoff'])} · Wind-down {t(c['wind_down_start'])} · "
@@ -815,6 +944,20 @@ def alcohol_line(m: Dict[str, Any]) -> str:
     if v is None:
         return "Alcohol last night: not logged — /drinks N"
     return f"Alcohol last night: {v:g}"
+
+
+def overnight_line(o: Optional[Dict[str, Any]]) -> str:
+    """'Overnight: 245.2 → 242.8 lb = −2.4 lb (~1090 mL, 8.6 h)' — the sign is the weight CHANGE (loss = −)."""
+    if not o:
+        return "Overnight: no weigh-ins (scale)"
+    if o.get("missing") == "pm":
+        return f"Overnight: missing bedtime weigh-in (AM {o.get('am_weight_lb')} lb at {_clock(o.get('am_time'))})"
+    if o.get("missing") == "am":
+        return f"Overnight: missing morning weigh-in (bed {o.get('pm_weight_lb')} lb at {_clock(o.get('pm_time'))})"
+    d = o.get("delta_lb") or 0.0
+    sign = "−" if d > 0 else "+" if d < 0 else "±"
+    return (f"Overnight: {o.get('pm_weight_lb')} → {o.get('am_weight_lb')} lb = {sign}{abs(d):.1f} lb "
+            f"(~{abs(o.get('delta_ml_est') or 0)} mL, {o.get('hours_between')} h)")
 
 
 def weather_line(w: Optional[Dict[str, Any]]) -> str:
@@ -1101,6 +1244,8 @@ def main() -> int:
     if a.mock:
         raw = mock_raw(day)
         raw.update(MOCK_CASES[a.mock].get("raw", {}))
+        if "overnight" in MOCK_CASES[a.mock]:
+            raw["weigh_ins_range"] = mock_weigh_ins(day, **MOCK_CASES[a.mock]["overnight"])
     else:
         raw = None if a.refresh else cached_raw(day)
         if raw is None:
@@ -1130,6 +1275,7 @@ def main() -> int:
     metrics.update(sleep_timing(raw, sn))                                     # record-only
     metrics["alcohol_drinks"] = (MOCK_CASES[a.mock].get("alcohol") if a.mock
                                  else alcohol_for_night(day - timedelta(days=1)))   # None = not logged (never 0)
+    overnight = overnight_delta(raw, day)                                       # display only (null on any failure)
     cls = classify(metrics, cpap, sn, wx)
     tier = cls["tier"]
     payload = {
@@ -1143,6 +1289,7 @@ def main() -> int:
         "cpap": cpap,
         "sleepnumber": sn,
         "weather": wx,
+        "overnight": overnight,
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
