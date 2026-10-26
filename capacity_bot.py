@@ -14,8 +14,20 @@ Commands (owner chat only; TELEGRAM_CHAT_ID in this folder's .env, never anyone 
              Before 14:00 the entry is for LAST night (yesterday's date), from 14:00 on for TONIGHT (today's
              date); an explicit date wins: /drinks 2 10/22. Re-logging a night appends a new row; the
              morning run takes the last row (garmin_capacity.alcohol_for_night). Never assumes 0.
+  /checkin   start the nightly check-in now (see below)
   /help      list the commands
 Anything else gets a one-line hint. The commands are registered with setMyCommands at start.
+
+Nightly check-in (2026-10-25, display only): at CHECKIN_TIME (default 23:15, .env CHECKIN_TIME=HH:MM) the bot
+asks four inline-button questions: drinks today (None/1/2/3/4+; shows what /drinks already logged; the answer
+sets the day's total and is written to data\\alcohol.csv with source "checkin"), NEW open wounds (No/Yes ->
+1/2/3+ -> sites multi-select -> Done), older wounds (None open/Healing/Getting worse), exercise (No/Yes -> types
+multi-select -> Done -> <15/15-30/30-60/60+). One nudge CHECKIN_NUDGE_MIN after the last prompt; still silent
+CHECKIN_SKIP_MIN after it -> the row is logged as "skipped" with the answers given so far. The day follows the
+/drinks rule (checkin_day: before 14:00 = yesterday). Rows: data\\checkin.csv (garmin_capacity.CHECKIN_FIELDS,
+append-only, last row per day wins). The in-flight session is persisted in data\\checkin_state.json so a bot
+restart resumes it. A missed 23:15 start is made up until CHECKIN_WINDOW_H later. Backfill / manual rows:
+python capacity_bot.py --checkin-log 2026-10-24 new_wounds=yes new_wound_count=unknown new_wound_sites=Scalp exercise=no
 
 Safety and liveness:
   * single instance: data\\capacity_bot.lock holds the PID; a second copy exits 0 if the holder is alive.
@@ -57,9 +69,10 @@ COMMANDS = [
     {"command": "capacity", "description": "Current Body Battery, stress, HR (live Garmin pull)"},
     {"command": "today", "description": "This morning's capacity card"},
     {"command": "drinks", "description": "Log alcohol: /drinks N [M/D] (0-10; before 2 PM = last night)"},
+    {"command": "checkin", "description": "Nightly check-in now: drinks, new/older wounds, exercise (buttons)"},
     {"command": "help", "description": "List the commands"},
 ]
-HINT = "Unknown command. Try /capacity, /today, /drinks or /help."
+HINT = "Unknown command. Try /capacity, /today, /drinks, /checkin or /help."
 DRINKS_USAGE = ("Usage: /drinks N [M/D]  — N = 0-10 drinks (halves OK, e.g. 1.5). "
                 "Before 2 PM it counts for last night, from 2 PM on for tonight; add a date to override: /drinks 2 10/22")
 
@@ -305,6 +318,288 @@ def help_text() -> str:
     return "Health Consultant — capacity planner\n" + "\n".join(f"/{c['command']} - {c['description']}" for c in COMMANDS)
 
 
+# ───────────────────────────── nightly check-in (inline buttons) ─────────────────────────────
+CHECKIN_TIME = os.getenv("CHECKIN_TIME", "23:15")   # wind-down start, HH:MM local (.env CHECKIN_TIME overrides)
+CHECKIN_NUDGE_MIN = 45                               # one nudge this long after the last prompt / answer ...
+CHECKIN_SKIP_MIN = 90                                # ... and logged as skipped this long after it (45 min past the nudge)
+CHECKIN_WINDOW_H = 6                                 # a missed start (bot down) is still made up this long after CHECKIN_TIME
+CHECKIN_STATE_FILE = DATA_DIR / "checkin_state.json"
+WOUND_SITES = ["Face/mouth", "Scalp", "Hands/arms", "Legs/feet", "Torso/back", "Other"]
+EXERCISE_TYPES = ["Strength training", "Treadmill", "Walking outside", "Elliptical", "Biking", "Hiking"]
+EXERCISE_MINUTES = ["<15", "15-30", "30-60", "60+"]
+CHECKIN_NEXT = {"drinks": "wounds_new", "wounds_new": {"no": "wounds_older", "yes": "wounds_count"},
+                "wounds_count": "wounds_sites", "wounds_sites": "wounds_older", "wounds_older": "exercise",
+                "exercise": {"no": "done", "yes": "exercise_types"}, "exercise_types": "exercise_minutes",
+                "exercise_minutes": "done"}
+CHECKIN_MULTI = {"wounds_sites": ("new_wound_sites", WOUND_SITES), "exercise_types": ("exercise_types", EXERCISE_TYPES)}
+CHECKIN_FIELD = {"drinks": "drinks", "wounds_new": "new_wounds", "wounds_count": "new_wound_count",
+                 "wounds_older": "older_wounds", "exercise": "exercise", "exercise_minutes": "exercise_minutes"}
+CHECKIN_LABEL = {"0": "None", "no": "No", "yes": "Yes", "none": "None open", "healing": "Healing", "worse": "Getting worse"}
+
+_session: Optional[Dict[str, Any]] = None   # the one in-flight check-in (owner chat only)
+
+
+def checkin_day(now: datetime) -> date:
+    """Same rule as /drinks: before 14:00 the check-in belongs to yesterday (the evening that just ended),
+    from 14:00 on to today — so the check-in's drinks and /drinks always name the same night."""
+    return now.date() - timedelta(days=1) if now.hour < gc.ALCOHOL_CUTOVER_H else now.date()
+
+
+def _day_label(d: date) -> str:
+    return f"{d.strftime('%a')} {d.month}/{d.day}"
+
+
+def _kb(rows) -> Dict[str, Any]:
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+
+
+def _multi_rows(step: str, options: List[str], chosen: List[str]):
+    rows = [[(("☑ " if o in chosen else "☐ ") + o, f"ci|{step}|{j}") for j, o in list(enumerate(options))[i:i + 2]]
+            for i in range(0, len(options), 2)]
+    rows.append([("Done ✓", f"ci|{step}|done")])
+    return rows
+
+
+def checkin_question(s: Dict[str, Any]):
+    """(text, button rows) for the session's current step."""
+    step, a, d = s["step"], s["answers"], date.fromisoformat(s["day"])
+    if step == "drinks":
+        prior = gc.alcohol_for_night(d)
+        note = f"(/drinks logged {prior:g} so far)" if prior is not None else "(nothing logged via /drinks yet)"
+        return (f"Check-in {_day_label(d)} — 1/4  Drinks today? {note}",
+                [[("None", "ci|drinks|0"), ("1", "ci|drinks|1"), ("2", "ci|drinks|2"), ("3", "ci|drinks|3"), ("4+", "ci|drinks|4+")]])
+    if step == "wounds_new":
+        return "2/4  NEW open wounds today?", [[("No", "ci|wounds_new|no"), ("Yes", "ci|wounds_new|yes")]]
+    if step == "wounds_count":
+        return "How many new wounds?", [[("1", "ci|wounds_count|1"), ("2", "ci|wounds_count|2"), ("3+", "ci|wounds_count|3+")]]
+    if step == "wounds_sites":
+        return "Where? Tap all that apply, then Done.", _multi_rows("wounds_sites", WOUND_SITES, a.get("new_wound_sites") or [])
+    if step == "wounds_older":
+        return "3/4  Older wounds?", [[("None open", "ci|wounds_older|none"), ("Healing", "ci|wounds_older|healing"),
+                                      ("Getting worse", "ci|wounds_older|worse")]]
+    if step == "exercise":
+        return "4/4  Exercise today?", [[("No", "ci|exercise|no"), ("Yes", "ci|exercise|yes")]]
+    if step == "exercise_types":
+        return "What kind? Tap all that apply, then Done.", _multi_rows("exercise_types", EXERCISE_TYPES, a.get("exercise_types") or [])
+    if step == "exercise_minutes":
+        return "How long?", [[(m, f"ci|exercise_minutes|{m}") for m in EXERCISE_MINUTES]]
+    raise ValueError(f"no question for step {step}")
+
+
+def _save_session() -> None:
+    try:
+        CHECKIN_STATE_FILE.write_text(json.dumps(_session or {}), encoding="utf-8")
+    except Exception as e:
+        log.warning("check-in state write failed: %s", e)
+
+
+def _load_session() -> None:
+    global _session
+    try:
+        s = json.loads(CHECKIN_STATE_FILE.read_text(encoding="utf-8")) if CHECKIN_STATE_FILE.exists() else {}
+        _session = s if s and s.get("step") else None
+        if _session:
+            log.info("check-in for %s resumed at step %s", _session["day"], _session["step"])
+    except Exception as e:
+        log.warning("check-in state unreadable (%s); starting without one", e)
+        _session = None
+
+
+def _ask(s: Dict[str, Any], now: datetime, reset_clock: bool = True) -> None:
+    text, rows = checkin_question(s)
+    s["q_text"] = text
+    try:
+        r = api("sendMessage", {"chat_id": s["chat_id"], "text": text[:4000], "reply_markup": _kb(rows)})
+        s["msg_id"] = (r or {}).get("message_id")
+    except Exception as e:
+        log.warning("check-in question failed: %s", e)
+        s["msg_id"] = None
+    if reset_clock:
+        s["last_prompt_at"] = now.isoformat(timespec="seconds")
+        s["nudged"] = False
+    _save_session()
+
+
+def _edit(chat_id, message_id, text: Optional[str] = None, rows=None) -> None:
+    if not message_id:
+        return
+    try:
+        if text is not None:
+            body = {"chat_id": chat_id, "message_id": message_id, "text": text[:4000]}
+            if rows is not None:
+                body["reply_markup"] = _kb(rows)
+            api("editMessageText", body)
+        elif rows is not None:
+            api("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": _kb(rows)})
+    except Exception as e:
+        log.warning("edit failed: %s", e)
+
+
+def _answer_cb(cq_id, text: Optional[str] = None) -> None:
+    try:
+        api("answerCallbackQuery", {"callback_query_id": cq_id, **({"text": text} if text else {})})
+    except Exception as e:
+        log.warning("answerCallbackQuery failed: %s", e)
+
+
+def start_checkin(chat_id, now: Optional[datetime] = None, trigger: str = "command") -> None:
+    global _session
+    now = now or datetime.now()
+    _session = {"day": checkin_day(now).isoformat(), "chat_id": chat_id, "started_at": now.isoformat(timespec="seconds"),
+                "step": "drinks", "answers": {}, "msg_id": None, "q_text": "", "last_prompt_at": now.isoformat(timespec="seconds"),
+                "nudged": False, "trigger": trigger}
+    log.info("check-in %s started (%s)", _session["day"], trigger)
+    _ask(_session, now)
+
+
+def apply_answer(s: Dict[str, Any], step: str, value: str) -> bool:
+    """Record one button press. Returns True when the step is complete (False = a multi-select toggle)."""
+    a = s["answers"]
+    if step in CHECKIN_MULTI:
+        key, opts = CHECKIN_MULTI[step]
+        lst = a.setdefault(key, [])
+        if value != "done":
+            o = opts[int(value)]
+            lst.remove(o) if o in lst else lst.append(o)
+            return False
+    else:
+        a[CHECKIN_FIELD[step]] = value
+    nxt = CHECKIN_NEXT[step]
+    s["step"] = nxt[value] if isinstance(nxt, dict) else nxt
+    return True
+
+
+def finish_checkin(s: Dict[str, Any], now: datetime, status: str) -> Dict[str, Any]:
+    """Write the checkin.csv row (+ the drinks total to alcohol.csv when answered) and clear the session."""
+    global _session
+    day = date.fromisoformat(s["day"])
+    row = gc.checkin_row(day, s["answers"], started_at=datetime.fromisoformat(s["started_at"]), finished_at=now,
+                         status=status, trigger=s.get("trigger", ""), source="telegram")
+    try:
+        gc.checkin_log(row)
+    except Exception as e:
+        log.warning("check-in log write failed: %s: %s", type(e).__name__, e)
+    n = gc.checkin_drinks_value(s["answers"].get("drinks"))
+    if n is not None:
+        try:
+            gc.alcohol_log(day, n, source="checkin", at=now)
+        except Exception as e:
+            log.warning("alcohol log write failed: %s: %s", type(e).__name__, e)
+    log.info("check-in %s %s: %s", s["day"], status, gc.checkin_line(gc.checkin_for_day(day)))
+    _session = None
+    _save_session()
+    return row
+
+
+def handle_callback(cq: Dict[str, Any], owner: str, now: Optional[datetime] = None) -> str:
+    """One inline-button press. Owner only; a press for a finished / other step is acknowledged and ignored."""
+    now = now or datetime.now()
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    sender = (cq.get("from") or {}).get("id")
+    if str(chat_id) != str(owner) or str(sender) != str(owner):
+        log.warning("ignored callback from non-owner chat=%s from=%s", chat_id, sender)
+        _answer_cb(cq.get("id"))
+        return "ignored_non_owner"
+    parts = (cq.get("data") or "").split("|")
+    if len(parts) != 3 or parts[0] != "ci":
+        _answer_cb(cq.get("id"))
+        return "cb_unknown"
+    step, value = parts[1], parts[2]
+    s = _session
+    if not s or str(s.get("chat_id")) != str(chat_id) or s.get("step") != step:
+        _answer_cb(cq.get("id"), "That check-in step is already finished — /checkin to redo it.")
+        return "cb_stale"
+    try:
+        advanced = apply_answer(s, step, value)
+    except (ValueError, IndexError, KeyError):
+        _answer_cb(cq.get("id"))
+        return "cb_bad"
+    _answer_cb(cq.get("id"))
+    if not advanced:
+        _edit(chat_id, s.get("msg_id"), rows=checkin_question(s)[1])
+        _save_session()
+        return "cb_toggle"
+    if step in CHECKIN_MULTI:
+        label = ", ".join(s["answers"].get(CHECKIN_MULTI[step][0]) or []) or "none"
+    else:
+        label = CHECKIN_LABEL.get(value, value)
+    _edit(chat_id, s.get("msg_id"), text=f"{s.get('q_text', '')}\n✓ {label}")
+    if s["step"] == "done":
+        finish_checkin(s, now, "done")
+        send(chat_id, "Saved. " + gc.checkin_line(gc.checkin_for_day(date.fromisoformat(s["day"]))))
+        return "checkin_done"
+    _ask(s, now)
+    return f"cb_{step}"
+
+
+def _scheduled_start(day: date) -> datetime:
+    """The wall-clock moment the check-in for `day` should start (an evening time belongs to that date,
+    a CHECKIN_TIME before 14:00 to the following morning)."""
+    h, m = map(int, CHECKIN_TIME.split(":"))
+    at = datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m)
+    return at + timedelta(days=1) if h < gc.ALCOHOL_CUTOVER_H else at
+
+
+def checkin_tick(owner: str, now: Optional[datetime] = None) -> str:
+    """Called every poll cycle: nudge / skip an idle session, or start the scheduled one. Never raises."""
+    now = now or datetime.now()
+    try:
+        s = _session
+        if s:
+            idle_min = (now - datetime.fromisoformat(s["last_prompt_at"])).total_seconds() / 60
+            if not s.get("nudged") and idle_min >= CHECKIN_NUDGE_MIN:
+                send(s["chat_id"], "Still up? One tap finishes tonight's check-in (it logs as skipped in 45 min).")
+                _ask(s, now, reset_clock=False)
+                s["nudged"] = True
+                _save_session()
+                return "nudged"
+            if s.get("nudged") and idle_min >= CHECKIN_SKIP_MIN:
+                finish_checkin(s, now, "skipped")
+                send(s["chat_id"], "Check-in logged as skipped (no answer). /checkin any time to redo it.")
+                return "skipped"
+            return "waiting"
+        day = checkin_day(now)
+        start = _scheduled_start(day)
+        if start <= now < start + timedelta(hours=CHECKIN_WINDOW_H) and gc.checkin_for_day(day) is None:
+            start_checkin(int(owner), now, trigger="scheduled")
+            return "started"
+        return "idle"
+    except Exception as e:
+        log.warning("check-in tick failed: %s: %s", type(e).__name__, e)
+        return "error"
+
+
+def cmd_checkin(chat_id, now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    if _session and str(_session.get("chat_id")) == str(chat_id):
+        _ask(_session, now)
+        return "checkin_resend"
+    start_checkin(chat_id, now, trigger="command")
+    return "checkin_start"
+
+
+def checkin_log_cli(args: List[str]) -> int:
+    """--checkin-log DAY key=value ...  (backfill / manual row; unknown fields are refused)."""
+    try:
+        day = date.fromisoformat(args[0])
+    except Exception:
+        print("usage: --checkin-log YYYY-MM-DD field=value ...  fields:", ", ".join(gc.CHECKIN_FIELDS[2:10]))
+        return 2
+    answers: Dict[str, Any] = {}
+    for kv in args[1:]:
+        k, _, v = kv.partition("=")
+        if k not in gc.CHECKIN_FIELDS[2:10]:
+            print(f"unknown field {k!r}; allowed: {', '.join(gc.CHECKIN_FIELDS[2:10])}")
+            return 2
+        answers[k] = v.split(";") if k in gc.CHECKIN_LIST_FIELDS else v
+    row = gc.checkin_row(day, answers, status="done", trigger="manual", source="backfill")
+    gc.checkin_log(row)
+    print("logged:", json.dumps(row))
+    print(gc.checkin_line(gc.checkin_for_day(day)))
+    return 0
+
+
 def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> str:
     """Process one message. Returns an outcome tag (for the heartbeat and tests)."""
     chat_id = (message.get("chat") or {}).get("id")
@@ -328,6 +623,8 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
         args = (message.get("text") or "").strip().split(None, 1)
         send(chat_id, cmd_drinks(args[1] if len(args) > 1 else ""))
         return "drinks"
+    if cmd == "checkin":
+        return cmd_checkin(chat_id, datetime.fromtimestamp(now) if now else None)
     if cmd in ("help", "start"):
         send(chat_id, help_text())
         return "help"
@@ -337,7 +634,7 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
 
 # ───────────────────────────── main loop ─────────────────────────────
 def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
-    params: Dict[str, Any] = {"timeout": POLL_TIMEOUT_S, "allowed_updates": ["message"]}
+    params: Dict[str, Any] = {"timeout": POLL_TIMEOUT_S, "allowed_updates": ["message", "callback_query"]}
     if offset is not None:
         params["offset"] = offset
     updates: List[dict] = api("getUpdates", params, timeout=POLL_TIMEOUT_S + 15) or []
@@ -345,14 +642,21 @@ def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
     for upd in updates:
         uid = upd.get("update_id")
         msg = upd.get("message") or {}
+        cq = upd.get("callback_query") or {}
         try:
             if msg:
                 last_cmd = handle(msg, owner)
                 log.info("update %s -> %s", uid, last_cmd)
+            elif cq:
+                last_cmd = handle_callback(cq, owner)
+                log.info("update %s (button) -> %s", uid, last_cmd)
         except Exception as e:
             log.exception("update %s failed: %s", uid, e)
         offset = uid + 1
         save_offset(offset)          # after each update: a crash never replays a handled command
+    tick = checkin_tick(owner)
+    if tick not in ("idle", "waiting"):
+        last_cmd = f"checkin_{tick}"
     write_heartbeat(offset, last_cmd)
     return offset
 
@@ -360,7 +664,11 @@ def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="one poll cycle, then exit")
+    ap.add_argument("--checkin-log", nargs="+", metavar="ARG",
+                    help="append a check-in row and exit: --checkin-log YYYY-MM-DD field=value ... (backfill)")
     a = ap.parse_args()
+    if a.checkin_log:
+        return checkin_log_cli(a.checkin_log)
     fmt = logging.Formatter("%(asctime)s %(levelname)s capacity_bot %(message)s")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     handlers: List[logging.Handler] = [AppendPerRecordHandler()]
@@ -396,9 +704,10 @@ def main() -> int:
             write_heartbeat(None, "starting")
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
-        log.info("started as @%s (pid %s), owner chat set, %d commands registered",
-                 me.get("username"), os.getpid(), len(COMMANDS))
+        log.info("started as @%s (pid %s), owner chat set, %d commands registered, check-in at %s",
+                 me.get("username"), os.getpid(), len(COMMANDS), CHECKIN_TIME)
         offset = load_offset()
+        _load_session()
         backoff = 5
         while True:
             try:

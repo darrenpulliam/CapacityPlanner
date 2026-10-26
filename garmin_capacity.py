@@ -110,6 +110,13 @@ Overnight fluid loss (2026-10-25, display only): Garmin Index scale weigh-ins vi
   payload.as_of = the Garmin pull time, shown on card line 1 "(as of 09:00)"; a late weigh-in carries
   overnight.fetched_at and the Overnight line ends with "· as of 12:15". --dry-run on the update pass prints
   only (no save, no send), so it never masks the real 12:15 change detection.
+Nightly check-in (2026-10-25, display only; capacity_bot.py asks it with inline buttons at CHECKIN_TIME, default
+  23:15, or on /checkin): drinks today, NEW open wounds (count + sites), older wounds, exercise (types + minutes).
+  One row per check-in appended to data\\checkin.csv (CHECKIN_FIELDS; the last row for a day wins; status done |
+  skipped). The day follows the /drinks rule (before 14:00 = yesterday), and the drinks answer is ALSO written to
+  data\\alcohol.csv (source "checkin"), so metrics.alcohol_drinks and the check-in agree. The morning run puts
+  the previous evening's row in payload.checkin (lists for sites / types; null when none) and one card line
+  "Check-in Sat 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -134,6 +141,10 @@ HISTORY_CSV = DATA_DIR / "history.csv"
 ALCOHOL_CSV = DATA_DIR / "alcohol.csv"      # night_date,drinks,logged_at,source — append-only, last row per night wins
 ALCOHOL_MAX_DRINKS = 10.0                    # /drinks accepts 0-10 in halves
 ALCOHOL_CUTOVER_H = 14                       # /drinks before 14:00 = last night; from 14:00 on = tonight
+CHECKIN_CSV = DATA_DIR / "checkin.csv"      # nightly check-in rows (capacity_bot.py) — append-only, last row per day wins
+CHECKIN_FIELDS = ["day", "status", "drinks", "new_wounds", "new_wound_count", "new_wound_sites", "older_wounds",
+                  "exercise", "exercise_types", "exercise_minutes", "started_at", "finished_at", "trigger", "source"]
+CHECKIN_LIST_FIELDS = ("new_wound_sites", "exercise_types")   # stored ";"-joined, read back as lists
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
 
@@ -481,6 +492,12 @@ MOCK_CASES = {
     "overnight-am-only": {"overnight": {"am": 242.8}},                                                        # no bedtime weigh-in: missing "pm"
     "overnight-none":    {"overnight": {}},                                                                   # scale unused: overnight null
     "overnight-late-am": {"overnight": {"pm": 245.2, "am": 242.8, "am_at": "09:40"}},                       # AM weigh-in after the 09:00 run (10.1 h); the 12:15 pass picks it up
+    # nightly check-in (display only): payload.checkin + one card line; tier / bedtime unchanged
+    "checkin":          {"checkin": {"status": "done", "drinks": "2", "new_wounds": "yes", "new_wound_count": "1",
+                                     "new_wound_sites": ["Scalp"], "older_wounds": "healing", "exercise": "yes",
+                                     "exercise_types": ["Walking outside"], "exercise_minutes": "30-60"}, "alcohol": 2},
+    "checkin-skipped":  {"checkin": {"status": "skipped", "drinks": "", "new_wounds": "", "older_wounds": "", "exercise": ""}},
+    "checkin-none":     {"checkin": None},                                                                    # no row -> "Check-in: none"
 }
 
 
@@ -632,9 +649,10 @@ def alcohol_for_night(night: date) -> Optional[float]:
         if not ALCOHOL_CSV.exists():
             return None
         val = None
-        for r in csv.DictReader(ALCOHOL_CSV.open(encoding="utf-8")):
-            if r.get("night_date") == night.isoformat() and r.get("drinks") not in (None, ""):
-                val = float(r["drinks"])
+        with ALCOHOL_CSV.open(encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r.get("night_date") == night.isoformat() and r.get("drinks") not in (None, ""):
+                    val = float(r["drinks"])
         return val
     except Exception as e:
         log.warning("alcohol log unreadable: %s: %s", type(e).__name__, e)
@@ -719,6 +737,106 @@ def overnight_delta(raw: Optional[Dict[str, Any]], day: date) -> Optional[Dict[s
     except Exception as e:
         log.warning("overnight weigh-in delta skipped: %s: %s", type(e).__name__, e)
         return None
+
+
+def checkin_row(day: date, answers: Optional[Dict[str, Any]], started_at: Optional[datetime] = None,
+                finished_at: Optional[datetime] = None, status: str = "done", trigger: str = "",
+                source: str = "telegram") -> Dict[str, Any]:
+    """One data\\checkin.csv row from the bot's answers dict. Unanswered = "" (never 0 / "no" by default)."""
+    a = answers or {}
+
+    def cell(k):
+        v = a.get(k)
+        if v is None:
+            return ""
+        return ";".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v)
+
+    row = {k: cell(k) for k in CHECKIN_FIELDS}
+    row.update(day=day.isoformat(), status=status, trigger=trigger, source=source,
+               started_at=started_at.isoformat(timespec="seconds") if started_at else "",
+               finished_at=(finished_at or datetime.now()).isoformat(timespec="seconds"))
+    return row
+
+
+def checkin_log(row: Dict[str, Any]) -> None:
+    """Append one row to data\\checkin.csv (header on first write). Re-doing a day appends; readers take the LAST row."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new = not CHECKIN_CSV.exists() or CHECKIN_CSV.stat().st_size == 0
+    with CHECKIN_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CHECKIN_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in CHECKIN_FIELDS})
+
+
+def checkin_for_day(day: date) -> Optional[Dict[str, Any]]:
+    """Last check-in row for `day` (the evening's date) with list fields split, or None. Never raises."""
+    try:
+        if not CHECKIN_CSV.exists():
+            return None
+        row = None
+        with CHECKIN_CSV.open(encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r.get("day") == day.isoformat():
+                    row = r
+        if row is None:
+            return None
+        out = {k: (row.get(k) or "") for k in CHECKIN_FIELDS}
+        for k in CHECKIN_LIST_FIELDS:
+            out[k] = [x for x in out[k].split(";") if x]
+        return out
+    except Exception as e:
+        log.warning("check-in log unreadable: %s: %s", type(e).__name__, e)
+        return None
+
+
+def checkin_drinks_value(v: Any) -> Optional[float]:
+    """Check-in drinks answer -> number for alcohol.csv: "4+" -> 4.0; "" / "unknown" -> None (not logged)."""
+    try:
+        t = str(v if v is not None else "").strip().lower()
+        if t in ("", "unknown", "?"):
+            return None
+        return float(t.rstrip("+"))
+    except Exception:
+        return None
+
+
+def checkin_line(c: Optional[Dict[str, Any]]) -> str:
+    """One card line for last night's check-in. Unanswered pieces show as '?', never as 'no' or 0."""
+    if not c:
+        return "Check-in: none"
+    try:
+        d = date.fromisoformat(c.get("day"))
+        lbl = f"Check-in {d.strftime('%a')} {d.month}/{d.day}"
+    except Exception:
+        lbl = "Check-in"
+    if c.get("status") == "skipped":
+        lbl += " (skipped)"
+    parts = []
+    dr = (c.get("drinks") or "").strip()
+    parts.append("drinks none" if dr == "0" else f"drinks {dr}" if dr and dr != "unknown" else "drinks ?")
+    nw = (c.get("new_wounds") or "").lower()
+    if nw == "yes":
+        n = (c.get("new_wound_count") or "").strip()
+        sites = c.get("new_wound_sites") or []
+        parts.append(f"new wounds {n if n and n != 'unknown' else '?'} ({', '.join(sites) if sites else '?'})")
+    elif nw == "no":
+        parts.append("no new wounds")
+    else:
+        parts.append("new wounds ?")
+    older = {"none": "older: none open", "healing": "older: healing", "worse": "older: WORSE"}.get((c.get("older_wounds") or "").lower())
+    if older:
+        parts.append(older)
+    ex = (c.get("exercise") or "").lower()
+    if ex == "yes":
+        types = c.get("exercise_types") or []
+        mins = (c.get("exercise_minutes") or "").strip()
+        parts.append(("exercise " + (", ".join(types) if types else "?") + (f" {mins} min" if mins else "")).strip())
+    elif ex == "no":
+        parts.append("no exercise")
+    else:
+        parts.append("exercise ?")
+    return f"{lbl}: " + " · ".join(parts)
 
 
 def published(day: date) -> Optional[Dict[str, Any]]:
@@ -966,6 +1084,7 @@ def card(payload: Dict[str, Any]) -> str:
         f"{weather_line(payload.get('weather'))}\n"
         f"{slept_line(m)}\n"
         f"{alcohol_line(m)}\n"
+        f"{checkin_line(payload.get('checkin'))}\n"
         f"{overnight_line(payload.get('overnight'))}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
         f"{payload['plan'].get('guidance', '')}\n"
@@ -1362,6 +1481,11 @@ def main() -> int:
     metrics["alcohol_drinks"] = (MOCK_CASES[a.mock].get("alcohol") if a.mock
                                  else alcohol_for_night(day - timedelta(days=1)))   # None = not logged (never 0)
     overnight = overnight_delta(raw, day)                                       # display only (null on any failure)
+    if a.mock:
+        ck = MOCK_CASES[a.mock].get("checkin")
+        checkin = {"day": str(day - timedelta(days=1)), **ck} if ck else None
+    else:
+        checkin = checkin_for_day(day - timedelta(days=1))                      # last evening's check-in (display only)
     cls = classify(metrics, cpap, sn, wx)
     tier = cls["tier"]
     payload = {
@@ -1377,6 +1501,7 @@ def main() -> int:
         "sleepnumber": sn,
         "weather": wx,
         "overnight": overnight,
+        "checkin": checkin,
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
