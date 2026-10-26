@@ -30,8 +30,11 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 
 # Times match the live tasks (retimed 2026-10-16 from 07:25/08:40). Capacity_Now has NO trigger:
 # it runs on demand (Start-ScheduledTask \Capacity\Capacity_Now, or /capacity on @dp_health_consultant_bot).
+# Capacity_Morning (2026-10-25) has TWO daily triggers: 09:00 = the morning pull + publish; 12:15 = the overnight
+# weigh-in update pass (same command line — the script sees the day is already published and fetches only the
+# weigh-in range, re-sending the card + mail only when payload.overnight changed).
 $jobs = @(
-    @{ Name = "Capacity_Morning"; At = "09:00"; Args = "" },
+    @{ Name = "Capacity_Morning"; At = @("09:00", "12:15"); Args = "" },
     @{ Name = "Capacity_Retry";   At = "10:15"; Args = "--if-missing" },
     @{ Name = "Capacity_Now";     At = $null;   Args = "--now" }
 )
@@ -42,13 +45,16 @@ foreach ($j in $jobs) {
     if ($j.At) {
         # DST (2026-10-18): `-At` stores a FIXED offset (e.g. 09:00:00-04:00), which fires an hour early after the
         # fall-back change. A naive local StartBoundary follows wall-clock time across DST.
-        $trig = New-ScheduledTaskTrigger -Daily -At $j.At
-        $trig.StartBoundary = (Get-Date $j.At).ToString('yyyy-MM-ddTHH:mm:ss')
+        $trig = @(foreach ($at in @($j.At)) {
+            $tr = New-ScheduledTaskTrigger -Daily -At $at
+            $tr.StartBoundary = (Get-Date $at).ToString('yyyy-MM-ddTHH:mm:ss')
+            $tr
+        })
         $reg.Trigger = $trig
     }
     Register-ScheduledTask @reg | Out-Null
     $t = Get-ScheduledTask -TaskPath "\Capacity\" -TaskName $j.Name
-    $when = if ($j.At) { $j.At } else { "on demand" }
+    $when = if ($j.At) { @($j.At) -join " + " } else { "on demand" }
     Write-Host ("  {0,-18} {1}  logon={2} batteryStop={3} startWhenAvailable={4}" -f $j.Name, $when,
         $t.Principal.LogonType, $t.Settings.StopIfGoingOnBatteries, $t.Settings.StartWhenAvailable) -ForegroundColor Green
 }
@@ -74,4 +80,4 @@ git add garmin_capacity.py install_capacity.ps1 README.md .gitignore .env.exampl
 git commit -m "Capacity Planner: Garmin Body Battery -> capacity tier + circadian targets; tasks 07:25/08:40"
 Pop-Location
 
-Write-Host "`nDone. First real run tomorrow 09:00 (retry 10:15). On demand: Start-ScheduledTask -TaskPath '\Capacity\' -TaskName Capacity_Now" -ForegroundColor Yellow
+Write-Host "`nDone. First real run tomorrow 09:00 (retry 10:15, overnight weigh-in update 12:15). On demand: Start-ScheduledTask -TaskPath '\Capacity\' -TaskName Capacity_Now" -ForegroundColor Yellow

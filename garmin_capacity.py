@@ -102,6 +102,14 @@ Overnight fluid loss (2026-10-25, display only): Garmin Index scale weigh-ins vi
   line "Overnight: 245.2 → 242.8 lb = −2.4 lb (~1090 mL, 8.6 h)". Garmin's API returns only weigh-ins
   assigned to this profile, so a reading left unassigned on a shared scale is invisible here. Never
   changes tier / bedtime / blocks; a scale error logs a WARNING and sets overnight to null.
+  12:15 update pass (2026-10-25): Capacity_Morning has a SECOND daily trigger at 12:15 (same task, same
+  command line). A plain run that finds the day already published (data\\<date>.json with a tier) does not
+  re-pull: it fetches only get_weigh_ins(yesterday, today) (one request), recomputes payload.overnight and,
+  ONLY if it changed, rewrites the data files and re-sends the Telegram card and the [CAPACITY] mail (same
+  subject). Unchanged -> nothing written, nothing sent. --refresh still forces the full re-pull + re-publish.
+  payload.as_of = the Garmin pull time, shown on card line 1 "(as of 09:00)"; a late weigh-in carries
+  overnight.fetched_at and the Overnight line ends with "· as of 12:15". --dry-run on the update pass prints
+  only (no save, no send), so it never masks the real 12:15 change detection.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -472,12 +480,14 @@ MOCK_CASES = {
     "overnight-pm-only": {"overnight": {"pm": 245.2}},                                                        # no morning weigh-in: missing "am"
     "overnight-am-only": {"overnight": {"am": 242.8}},                                                        # no bedtime weigh-in: missing "pm"
     "overnight-none":    {"overnight": {}},                                                                   # scale unused: overnight null
+    "overnight-late-am": {"overnight": {"pm": 245.2, "am": 242.8, "am_at": "09:40"}},                       # AM weigh-in after the 09:00 run (10.1 h); the 12:15 pass picks it up
 }
 
 
-def mock_weigh_ins(day: date, pm: Optional[float] = None, am: Optional[float] = None) -> Dict[str, Any]:
+def mock_weigh_ins(day: date, pm: Optional[float] = None, am: Optional[float] = None,
+                   pm_at: str = "23:35", am_at: str = "08:11") -> Dict[str, Any]:
     """Garmin get_weigh_ins shape for --mock: grams + timestampGMT (UTC ms) built from ET wall-clock times
-    (bed 23:35 yesterday, morning 08:11 today -> 8.6 h)."""
+    (default bed 23:35 yesterday, morning 08:11 today -> 8.6 h)."""
     from datetime import timezone
 
     def rec(local: datetime, lb: float) -> Dict[str, Any]:
@@ -491,9 +501,9 @@ def mock_weigh_ins(day: date, pm: Optional[float] = None, am: Optional[float] = 
 
     days = {}
     if pm is not None:
-        days.setdefault(str(day - timedelta(days=1)), []).append(rec(hm_to_dt(day - timedelta(days=1), "23:35"), pm))
+        days.setdefault(str(day - timedelta(days=1)), []).append(rec(hm_to_dt(day - timedelta(days=1), pm_at), pm))
     if am is not None:
-        days.setdefault(str(day), []).append(rec(hm_to_dt(day, "08:11"), am))
+        days.setdefault(str(day), []).append(rec(hm_to_dt(day, am_at), am))
     return {"dailyWeightSummaries": [{"summaryDate": d, "numOfWeightEntries": len(v), "latestWeight": v[-1], "allWeightMetrics": v}
                                      for d, v in sorted(days.items())],
             "totalAverage": {}, "previousDateWeight": None, "nextDateWeight": None}
@@ -711,6 +721,67 @@ def overnight_delta(raw: Optional[Dict[str, Any]], day: date) -> Optional[Dict[s
         return None
 
 
+def published(day: date) -> Optional[Dict[str, Any]]:
+    """The day's saved payload when the morning run already published it (tier not UNKNOWN), else None."""
+    f = DATA_DIR / f"{day}.json"
+    try:
+        p = json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+    except Exception:
+        return None
+    return p if isinstance(p, dict) and p.get("tier") not in (None, "UNKNOWN") else None
+
+
+def _overnight_key(o: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """What counts as a change: every overnight field except the fetch stamp."""
+    return {k: v for k, v in o.items() if k != "fetched_at"} if o else None
+
+
+def run_overnight_update(day: date, dry_run: bool = False, client=None, now: Optional[datetime] = None) -> int:
+    """12:15 pass: the day is already published, so fetch ONLY the weigh-in range (one Garmin request),
+    recompute payload.overnight and, only when it changed, rewrite data\\<date>.json / latest.json / raw and
+    re-send the Telegram card + [CAPACITY] mail. Display only: tier, reasons, plan, circadian and history.csv
+    are untouched. Any failure -> WARNING and nothing changes (exit 0). Unchanged -> nothing written or sent."""
+    now = now or datetime.now()
+    payload = published(day)
+    if not payload:
+        log.warning("overnight update: %s is not published yet — nothing to update", day)
+        return 0
+    raw_f = RAW_DIR / f"{day}.json"
+    try:
+        raw = json.loads(raw_f.read_text(encoding="utf-8")) if raw_f.exists() else {}
+    except Exception:
+        raw = {}
+    try:
+        c = client or garmin_client()
+        raw["weigh_ins_range"] = c.get_weigh_ins((day - timedelta(days=1)).isoformat(), day.isoformat())
+    except Exception as e:
+        log.warning("overnight update: Garmin weigh-in fetch failed (%s: %s); overnight unchanged", type(e).__name__, e)
+        return 0
+    new, old = overnight_delta(raw, day), payload.get("overnight")
+    if _overnight_key(new) == _overnight_key(old):
+        log.info("overnight update %s %s: no change (%s) — nothing sent", day, now.strftime("%H:%M"), overnight_line(old))
+        return 0
+    if new:
+        new["fetched_at"] = now.isoformat(timespec="minutes")
+    payload["overnight"] = new
+    payload["overnight_updated_at"] = now.isoformat(timespec="seconds")
+    text = card(payload)
+    print(text)
+    if dry_run:
+        print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")
+        return 0
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    raw.setdefault("_meta", {})["overnight_fetched_at"] = now.isoformat(timespec="seconds")
+    raw_f.write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
+    (DATA_DIR / f"{day}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (DATA_DIR / "latest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tg = send_telegram(text)
+    ml = send_mail(payload, text)
+    log.info("overnight update %s %s: changed (%s) -> published: telegram=%s mail=%s",
+             day, now.strftime("%H:%M"), overnight_line(new), tg, ml)
+    return 0 if (tg or ml) else 2
+
+
 def _hm(iso: Optional[str]) -> str:
     try:
         return datetime.fromisoformat(iso).strftime("%H:%M")
@@ -887,7 +958,7 @@ def card(payload: Dict[str, Any]) -> str:
     sleep = f"{m['sleep_min']//60}h{m['sleep_min']%60:02d}" if m.get("sleep_min") else "n/a"
     src = f", {m['sleep_source']}" if m.get("sleep_source") and m.get("sleep_source") != "garmin" else ""
     return (
-        f"{icon} CAPACITY {payload['tier']} — {payload['date']}\n"
+        f"{icon} CAPACITY {payload['tier']} — {payload['date']}{as_of_phrase(payload)}\n"
         f"Body Battery at wake: {m.get('bb_wake')}  |  Sleep {sleep} (score {m.get('sleep_score')}{src})\n"
         f"HRV {m.get('hrv_last_night')} ({m.get('hrv_status')})  |  RHR {m.get('resting_hr')}  |  Readiness {m.get('readiness_score')}\n"
         f"{cpap_line(payload.get('cpap'))}\n"
@@ -946,18 +1017,29 @@ def alcohol_line(m: Dict[str, Any]) -> str:
     return f"Alcohol last night: {v:g}"
 
 
+def as_of_phrase(payload: Dict[str, Any]) -> str:
+    """' (as of 09:00)' from payload.as_of (the Garmin pull time), else fetched_at / generated_at."""
+    t = payload.get("as_of") or payload.get("fetched_at") or payload.get("generated_at")
+    try:
+        return f" (as of {datetime.fromisoformat(t).strftime('%H:%M')})"
+    except Exception:
+        return ""
+
+
 def overnight_line(o: Optional[Dict[str, Any]]) -> str:
-    """'Overnight: 245.2 → 242.8 lb = −2.4 lb (~1090 mL, 8.6 h)' — the sign is the weight CHANGE (loss = −)."""
+    """'Overnight: 245.2 → 242.8 lb = −2.4 lb (~1090 mL, 8.6 h)' — the sign is the weight CHANGE (loss = −).
+    A line refreshed by the 12:15 update pass ends with '· as of HH:MM' (overnight.fetched_at)."""
     if not o:
         return "Overnight: no weigh-ins (scale)"
+    tail = f" · as of {_hm(o['fetched_at'])}" if o.get("fetched_at") else ""
     if o.get("missing") == "pm":
-        return f"Overnight: missing bedtime weigh-in (AM {o.get('am_weight_lb')} lb at {_clock(o.get('am_time'))})"
+        return f"Overnight: missing bedtime weigh-in (AM {o.get('am_weight_lb')} lb at {_clock(o.get('am_time'))}){tail}"
     if o.get("missing") == "am":
-        return f"Overnight: missing morning weigh-in (bed {o.get('pm_weight_lb')} lb at {_clock(o.get('pm_time'))})"
+        return f"Overnight: missing morning weigh-in (bed {o.get('pm_weight_lb')} lb at {_clock(o.get('pm_time'))}){tail}"
     d = o.get("delta_lb") or 0.0
     sign = "−" if d > 0 else "+" if d < 0 else "±"
     return (f"Overnight: {o.get('pm_weight_lb')} → {o.get('am_weight_lb')} lb = {sign}{abs(d):.1f} lb "
-            f"(~{abs(o.get('delta_ml_est') or 0)} mL, {o.get('hours_between')} h)")
+            f"(~{abs(o.get('delta_ml_est') or 0)} mL, {o.get('hours_between')} h){tail}")
 
 
 def weather_line(w: Optional[Dict[str, Any]]) -> str:
@@ -1230,8 +1312,7 @@ def main() -> int:
         return 0 if wx else 1
 
     if a.if_missing:
-        f = DATA_DIR / f"{day}.json"
-        if f.exists() and json.loads(f.read_text(encoding="utf-8")).get("tier") != "UNKNOWN":
+        if published(day):
             log.info("already published for %s — retry not needed", day)
             return 0
 
@@ -1240,6 +1321,11 @@ def main() -> int:
         print(f"Garmin login OK — tokens stored in {TOKEN_DIR}. Daily runs are now non-interactive.")
         a.dry_run = True
         a.refresh = True  # the setup run is the day's one real fetch
+
+    if not a.mock and not a.refresh and published(day):
+        # 12:15 trigger (or any plain re-run) on a day that is already out: weigh-ins only, re-send only on change.
+        log.info("%s already published — overnight update pass (weigh-ins only); --refresh forces a full re-pull", day)
+        return run_overnight_update(day, a.dry_run)
 
     if a.mock:
         raw = mock_raw(day)
@@ -1281,6 +1367,7 @@ def main() -> int:
     payload = {
         "date": str(day),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "as_of": dig(raw, "_meta", "fetched_at") or datetime.now().isoformat(timespec="seconds"),   # Garmin pull time on card line 1
         "tier": tier,
         "reasons": cls["reasons"],
         "metrics": metrics,
