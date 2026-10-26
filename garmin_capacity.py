@@ -117,6 +117,16 @@ Nightly check-in (2026-10-25, display only; capacity_bot.py asks it with inline 
   data\\alcohol.csv (source "checkin"), so metrics.alcohol_drinks and the check-in agree. The morning run puts
   the previous evening's row in payload.checkin (lists for sites / types; null when none) and one card line
   "Check-in Sat 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
+Body Battery charge / drain block (2026-10-26, display only): payload.battery = {charged_overnight (BB at wake -
+  BB at last night's sleep start; fallback Garmin's bodyBatteryDuringSleep), sleep_hours, wake_bb, peak_bb /
+  peak_time, low_bb / low_time (yesterday's awake window), bb_at_bedtime, hours_awake (yesterday's wake -> sleep
+  start), drain_per_hr ((peak - bedtime BB) / hours peak -> sleep start), below25_at / below15_at (first time
+  yesterday BB fell under 25 / 15, null = never), rest_recharge_min (minutes yesterday BB rose while awake),
+  targets (7-day counts from history.csv: wake >= BB_WAKE_TARGET, daytime low >= BB_LOW_TARGET)}. Source: the
+  3-minute BB timeline inside get_stress_data (raw["stress"] for today, raw["stress_yesterday"] = the one extra
+  request for yesterday; falls back to yesterday's raw file). Yesterday's wake time: yesterday's raw sleep
+  record, else history.csv wake_time. Three card lines (🔋 / 📉 / 🎯); history.csv gains bat_* columns;
+  --battery-backfill fills them for past days from the raw cache (no Garmin call). Never changes the tier.
 --dry-run is write-free (2026-10-26): DRY_RUN gates every write under data\\ (raw cache, data\\<date>.json,
   latest.json, history.csv, now\\*, now_latest*, the weather raw cache and location cache in sources_extra)
   and prints "DRY RUN: nothing saved" after the payload. Auth / session files are exempt (Garmin tokens
@@ -136,9 +146,9 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ───────────────────────────── config ─────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent                  # ...\CapacityPlanner
@@ -149,6 +159,15 @@ ALCOHOL_CSV = DATA_DIR / "alcohol.csv"      # night_date,drinks,logged_at,source
 ALCOHOL_MAX_DRINKS = 10.0                    # /drinks accepts 0-10 in halves
 ALCOHOL_CUTOVER_H = 14                       # /drinks before 14:00 = last night; from 14:00 on = tonight
 CHECKIN_CSV = DATA_DIR / "checkin.csv"      # nightly check-in rows (capacity_bot.py) — append-only, last row per day wins
+BB_WAKE_TARGET = 60                          # 🎯 Body Battery at wake target (capacity goal, 2026-10-26)
+BB_LOW_TARGET = 15                           # 🎯 daytime BB should not fall below this
+BATTERY_FIELDS = ["charged_overnight", "sleep_hours", "wake_bb", "peak_bb", "peak_time", "low_bb", "low_time",
+                  "bb_at_bedtime", "hours_awake", "drain_per_hr", "below25_at", "below15_at", "rest_recharge_min"]
+BATTERY_HISTORY = {"charged_overnight": "bat_charged", "sleep_hours": "bat_sleep_h", "peak_bb": "bat_peak",
+                   "peak_time": "bat_peak_time", "low_bb": "bat_low", "low_time": "bat_low_time",
+                   "bb_at_bedtime": "bat_bedtime_bb", "hours_awake": "bat_hours_awake", "drain_per_hr": "bat_drain_per_hr",
+                   "below25_at": "bat_below25_at", "below15_at": "bat_below15_at", "rest_recharge_min": "bat_rest_recharge_min"}
+BB_GAP_MAX_MIN = 20                          # timeline gaps longer than this are not counted as recharge
 CHECKIN_FIELDS = ["day", "status", "drinks", "new_wounds", "new_wound_count", "new_wound_sites", "older_wounds",
                   "exercise", "exercise_types", "exercise_minutes", "started_at", "finished_at", "trigger", "source"]
 CHECKIN_LIST_FIELDS = ("new_wound_sites", "exercise_types")   # stored ";"-joined, read back as lists
@@ -426,6 +445,7 @@ def pull_garmin(day: date, interactive: bool = False) -> Dict[str, Any]:
         "weigh_ins": safe_call(c.get_daily_weigh_ins, d),
         "weigh_ins_range": safe_call(c.get_weigh_ins, (day - timedelta(days=1)).isoformat(), d),   # overnight delta
         "hydration": safe_call(c.get_hydration_data, d),
+        "stress_yesterday": safe_call(c.get_stress_data, (day - timedelta(days=1)).isoformat()),   # BB timeline for the battery block
     }
 
 
@@ -510,7 +530,70 @@ MOCK_CASES = {
                                      "exercise_types": ["Walking outside"], "exercise_minutes": "30-60"}, "alcohol": 2},
     "checkin-skipped":  {"checkin": {"status": "skipped", "drinks": "", "new_wounds": "", "older_wounds": "", "exercise": ""}},
     "checkin-none":     {"checkin": None},                                                                    # no row -> "Check-in: none"
+    # Body Battery charge / drain block (display only). "battery" = kwargs for mock_battery_raw.
+    "battery":          {"battery": {}},                                                                      # full data: +37 overnight, peak 65 -> 5, <25 / <15
+    "battery-no-sleep-start": {"battery": {"sleep_start": None}},                                             # no Garmin sleep start: charged falls back, drain null
+    "battery-never-low": {"battery": {"yday": [("00:00", 30), ("08:30", 70), ("10:30", 78), ("14:00", 55), ("19:00", 45), ("23:40", 40)],
+                                      "today": [("00:00", 41), ("08:00", 72)], "wake_bb": 72, "during_sleep": 32}},   # never under 25
+    "battery-day-off":  {"battery": {"prev_wake": "10:30", "yday": [("00:00", 30), ("10:30", 75), ("11:00", 80), ("14:00", 60), ("15:30", 68), ("20:00", 50), ("23:59", 46)],
+                                     "sleep_start": "+01:30", "today": [("00:00", 46), ("01:30", 45), ("09:30", 74)],
+                                     "sleep_end": "09:30", "wake_bb": 74, "during_sleep": 29}},              # late wake, gentle drain, a nap recharge
+    "battery-work-day": {"battery": {"prev_wake": "06:00", "yday": [("00:00", 25), ("06:00", 55), ("06:30", 55), ("12:00", 24), ("17:00", 14), ("22:30", 8)],
+                                     "sleep_start": "22:30", "today": [("00:00", 12), ("06:00", 35)],
+                                     "sleep_end": "06:00", "wake_bb": 35, "during_sleep": 27}},              # early wake, steep drain, <15 by 5 PM
 }
+
+
+def mock_battery_raw(day: date, prev_wake: str = "08:30",
+                     yday=(("00:00", 20), ("08:30", 60), ("10:30", 65), ("12:00", 40), ("13:00", 45), ("14:15", 24), ("18:40", 14), ("23:40", 5)),
+                     today=(("00:00", 6), ("08:00", 42)), sleep_start: Optional[str] = "23:40", sleep_end: Optional[str] = "08:00",
+                     wake_bb: Optional[int] = 42, during_sleep: int = 36) -> Dict[str, Any]:
+    """Garmin-shaped raw pieces for the battery block: 3-minute BB timelines for yesterday (raw["stress_yesterday"])
+    and today (raw["stress"]), a sleep record and stats. Anchors are ("HH:MM", level) on that day, interpolated
+    every 3 min. sleep_start "23:40" = yesterday evening, "+01:30" = after midnight today; None = no sleep record."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(OVERNIGHT_TZ)
+    yd = day - timedelta(days=1)
+
+    def at(d: date, hm: str) -> datetime:
+        return datetime.combine(d, datetime.min.time()).replace(hour=int(hm[:2]), minute=int(hm[3:]))
+
+    def series(d: date, anchors) -> Dict[str, Any]:
+        pts = [(at(d, hm), lvl) for hm, lvl in anchors]
+        arr = []
+        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+            t = t0
+            while t < t1:
+                frac = (t - t0).total_seconds() / (t1 - t0).total_seconds()
+                gmt_ms = int(t.replace(tzinfo=tz).astimezone(timezone.utc).timestamp() * 1000)
+                arr.append([gmt_ms, "MEASURED", int(round(v0 + (v1 - v0) * frac)), 3.0])
+                t += timedelta(minutes=3)
+        tl, vl = pts[-1]
+        arr.append([int(tl.replace(tzinfo=tz).astimezone(timezone.utc).timestamp() * 1000), "MEASURED", int(vl), 3.0])
+        start = datetime.combine(d, datetime.min.time())
+        return {"calendarDate": d.isoformat(), "startTimestampLocal": start.isoformat(timespec="seconds") + ".0",
+                "startTimestampGMT": start.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds") + ".0",
+                "bodyBatteryValuesArray": arr}
+
+    def local_ms(dt: datetime) -> int:
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)   # Garmin "...Local" = wall clock as epoch ms
+
+    dto: Dict[str, Any] = {"sleepScores": {"overall": {"value": 66}}, "sleepTimeSeconds": None}
+    if sleep_start and sleep_end:
+        s0 = at(day, sleep_start[1:]) if sleep_start.startswith("+") else at(yd, sleep_start)
+        s1 = at(day, sleep_end)
+        dto.update(sleepStartTimestampLocal=local_ms(s0), sleepEndTimestampLocal=local_ms(s1),
+                   sleepTimeSeconds=int((s1 - s0).total_seconds()) - 1200)
+    elif sleep_end:
+        dto["sleepTimeSeconds"] = 7 * 3600
+    return {
+        "stats": {"bodyBatteryAtWakeTime": wake_bb, "bodyBatteryHighestValue": wake_bb, "bodyBatteryMostRecentValue": wake_bb,
+                  "bodyBatteryDuringSleep": during_sleep, "averageStressLevel": 35, "restingHeartRate": 62},
+        "sleep": {"dailySleepDTO": dto, "avgOvernightHrv": 38, "hrvStatus": "BALANCED"},
+        "stress": series(day, today),
+        "stress_yesterday": series(yd, yday),
+        "_mock": {"prev_wake": at(yd, prev_wake).isoformat(timespec="minutes") if prev_wake else None},
+    }
 
 
 def mock_weigh_ins(day: date, pm: Optional[float] = None, am: Optional[float] = None,
@@ -749,6 +832,252 @@ def overnight_delta(raw: Optional[Dict[str, Any]], day: date) -> Optional[Dict[s
     except Exception as e:
         log.warning("overnight weigh-in delta skipped: %s: %s", type(e).__name__, e)
         return None
+
+
+def _bb_series(obj: Any) -> List[Tuple[datetime, int]]:
+    """[(local naive datetime, level)] from a get_stress_data (4-tuple entries) or get_body_battery (pairs) object.
+    GMT epoch ms -> local wall clock via the object's own startTimestampGMT/Local offset (ET fallback)."""
+    if not isinstance(obj, dict):
+        return []
+    arr = obj.get("bodyBatteryValuesArray") or []
+    off = None
+    try:
+        g, l = str(obj.get("startTimestampGMT")).replace(".0", ""), str(obj.get("startTimestampLocal")).replace(".0", "")
+        off = datetime.fromisoformat(l) - datetime.fromisoformat(g)
+    except Exception:
+        pass
+    out = []
+    for v in arr:
+        if not isinstance(v, (list, tuple)) or len(v) < 2:
+            continue
+        ts, lvl = v[0], (v[2] if len(v) >= 3 else v[1])
+        if not isinstance(ts, (int, float)) or not isinstance(lvl, (int, float)):
+            continue
+        t = (datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None) + off) if off is not None else _gmt_ms_to_et(ts)
+        if t is not None:
+            out.append((t.replace(second=0, microsecond=0), int(lvl)))
+    return sorted(set(out))
+
+
+def _bb_value_at(series: List[Tuple[datetime, int]], at: Optional[datetime], tol_min: int = 45) -> Optional[int]:
+    """Level at `at`: the last point at or before it (within tol), else the first point after it (within tol)."""
+    if at is None or not series:
+        return None
+    before = [(t, v) for t, v in series if t <= at and (at - t) <= timedelta(minutes=tol_min)]
+    if before:
+        return before[-1][1]
+    after = [(t, v) for t, v in series if t > at and (t - at) <= timedelta(minutes=tol_min)]
+    return after[0][1] if after else None
+
+
+def battery_metrics(raw: Optional[Dict[str, Any]], day: date, prev_raw: Optional[Dict[str, Any]] = None,
+                    prev_wake: Optional[str] = None, wake_bb: Optional[int] = None) -> Dict[str, Any]:
+    """Body Battery charge / drain block for the morning card (display only). Never raises: anything missing is null.
+    Timeline = yesterday (raw["stress_yesterday"] -> prev_raw["stress"] -> prev_raw["body_battery"]) + today
+    (raw["stress"] -> raw["body_battery"]). prev_wake = ISO local fallback for yesterday's wake (history.csv)."""
+    out: Dict[str, Any] = {k: None for k in BATTERY_FIELDS}
+    out["bedtime_at"] = None
+    try:
+        yday = day - timedelta(days=1)
+        series = (_bb_series(dig(raw, "stress_yesterday")) or _bb_series(dig(prev_raw, "stress"))
+                  or _bb_series(dig(prev_raw, "body_battery", 0)))
+        series = sorted(set(series + (_bb_series(dig(raw, "stress")) or _bb_series(dig(raw, "body_battery", 0)))))
+        dto = dig(raw, "sleep", "dailySleepDTO") or {}
+        s_start = _garmin_local_ms(dto.get("sleepStartTimestampLocal"))
+        s_end = _garmin_local_ms(dto.get("sleepEndTimestampLocal"))
+        if s_start and s_end and s_end <= s_start:
+            s_start = s_end = None
+        pw = _garmin_local_ms(dig(prev_raw, "sleep", "dailySleepDTO", "sleepEndTimestampLocal"))
+        if pw is None and prev_wake:
+            try:
+                pw = datetime.fromisoformat(prev_wake)
+            except Exception:
+                pw = None
+        if pw is not None and not (yday - timedelta(days=1) <= pw.date() <= yday):
+            pw = None
+
+        if wake_bb is None:
+            wake_bb = dig(raw, "stats", "bodyBatteryAtWakeTime")
+        if wake_bb is None and s_end:
+            wake_bb = _bb_value_at(series, s_end)
+        bed_bb = _bb_value_at(series, s_start) if s_start else None
+        out["wake_bb"] = int(wake_bb) if wake_bb is not None else None
+        out["bb_at_bedtime"] = bed_bb
+        out["bedtime_at"] = s_start.isoformat(timespec="minutes") if s_start else None
+        if wake_bb is not None and bed_bb is not None:
+            out["charged_overnight"] = int(wake_bb) - int(bed_bb)
+        else:
+            ds = dig(raw, "stats", "bodyBatteryDuringSleep")
+            out["charged_overnight"] = int(ds) if isinstance(ds, (int, float)) else None
+        if s_start and s_end:
+            out["sleep_hours"] = round((s_end - s_start).total_seconds() / 3600, 1)
+        elif dto.get("sleepTimeSeconds"):
+            out["sleep_hours"] = round(float(dto["sleepTimeSeconds"]) / 3600, 1)
+
+        # yesterday's awake window: previous wake (else 00:00 yesterday) -> last night's sleep start (else end of yesterday's data)
+        w0 = pw or datetime.combine(yday, datetime.min.time()).replace(hour=4)   # unknown wake: skip the prior night
+        yday_pts = [t for t, _ in series if t.date() == yday]
+        w1 = s_start or (yday_pts[-1] if yday_pts else datetime.combine(day, datetime.min.time()))
+        win = [(t, v) for t, v in series if w0 <= t <= w1] if yday_pts else []   # no points on yesterday: no day block
+        if win:
+            peak_t, peak_v = max(win, key=lambda x: (x[1], -x[0].timestamp()))     # first occurrence of the max
+            low_t, low_v = min(win, key=lambda x: (x[1], x[0].timestamp()))        # first occurrence of the min
+            out.update(peak_bb=peak_v, peak_time=peak_t.isoformat(timespec="minutes"),
+                       low_bb=low_v, low_time=low_t.isoformat(timespec="minutes"))
+            after = [(t, v) for t, v in win if t >= peak_t]
+            for thr, key in ((25, "below25_at"), (15, "below15_at")):
+                hit = next((t for t, v in after if v < thr), None)
+                out[key] = hit.isoformat(timespec="minutes") if hit else None
+            rise = 0.0
+            for (t0, v0), (t1, v1) in zip(win, win[1:]):
+                gap = (t1 - t0).total_seconds() / 60
+                if v1 > v0 and gap <= BB_GAP_MAX_MIN:
+                    rise += gap
+            out["rest_recharge_min"] = int(round(rise))
+            if s_start and bed_bb is not None:
+                hrs = (s_start - peak_t).total_seconds() / 3600
+                if hrs >= 0.5:
+                    out["drain_per_hr"] = round((peak_v - bed_bb) / hrs, 1)
+        if s_start and pw:
+            out["hours_awake"] = round((s_start - pw).total_seconds() / 3600, 1)
+    except Exception as e:
+        log.warning("battery block skipped: %s: %s", type(e).__name__, e)
+    return out
+
+
+def history_rows() -> List[Dict[str, Any]]:
+    """history.csv rows (never raises; [] when absent / unreadable)."""
+    try:
+        if not HISTORY_CSV.exists():
+            return []
+        with HISTORY_CSV.open(encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+    except Exception as e:
+        log.warning("history.csv unreadable: %s: %s", type(e).__name__, e)
+        return []
+
+
+def battery_targets(day: date, wake_bb_today: Optional[int], low_today: Optional[int]) -> Dict[str, Any]:
+    """7-day target counts (today + the 6 previous history.csv rows): wake BB >= BB_WAKE_TARGET, daytime low >= BB_LOW_TARGET.
+    Denominator = days in the window that have the value."""
+    out = {"wake_target": BB_WAKE_TARGET, "wake_hits": 0, "wake_days": 0, "low_target": BB_LOW_TARGET, "low_hits": 0, "low_days": 0}
+    try:
+        wake: Dict[str, Optional[float]] = {}
+        low: Dict[str, Optional[float]] = {}
+        lo, hi = (day - timedelta(days=6)).isoformat(), (day - timedelta(days=1)).isoformat()
+        for r in history_rows():
+            d = r.get("date") or ""
+            if lo <= d <= hi:
+                for src, dst in (("bb_wake", wake), ("bat_low", low)):
+                    v = (r.get(src) or "").strip()
+                    if v:
+                        try:
+                            dst[d] = float(v)
+                        except ValueError:
+                            pass
+        if wake_bb_today is not None:
+            wake[day.isoformat()] = float(wake_bb_today)
+        if low_today is not None:
+            low[day.isoformat()] = float(low_today)
+        out.update(wake_days=len(wake), wake_hits=sum(1 for v in wake.values() if v >= BB_WAKE_TARGET),
+                   low_days=len(low), low_hits=sum(1 for v in low.values() if v >= BB_LOW_TARGET))
+    except Exception as e:
+        log.warning("battery targets skipped: %s: %s", type(e).__name__, e)
+    return out
+
+
+def _clock(iso: Optional[str]) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%#I:%M %p" if os.name == "nt" else "%-I:%M %p")
+    except Exception:
+        return "?"
+
+
+def battery_lines(b: Optional[Dict[str, Any]]) -> str:
+    """🔋 / 📉 / 🎯 card lines. '?' for anything missing; a single 'no data' line when the whole block is empty."""
+    tg = (b or {}).get("targets") or {}
+    targets = (f"🎯 Targets: wake ≥{tg.get('wake_target', BB_WAKE_TARGET)} (7-day: {tg.get('wake_hits', 0)}/{tg.get('wake_days', 0)}) · "
+               f"low ≥{tg.get('low_target', BB_LOW_TARGET)} (7-day: {tg.get('low_hits', 0)}/{tg.get('low_days', 0)})")
+    no_timeline = not b or b.get("peak_bb") is None
+    if no_timeline and (not b or b.get("charged_overnight") is None):
+        return "🔋 Battery: no timeline data\n" + targets
+    q = lambda v: "?" if v is None else v
+    ch = b.get("charged_overnight")
+    charged = "?" if ch is None else f"{ch:+d}"
+    sl = b.get("sleep_hours")
+    l1 = f"🔋 Charged {charged} overnight ({q(sl)} h) · woke {q(b.get('wake_bb'))}"
+    if no_timeline:
+        return l1 + "\n📉 Yesterday: no Body Battery timeline\n" + targets
+    l2 = f"📉 Yesterday: peak {q(b.get('peak_bb'))} @ {_clock(b.get('peak_time'))} → {q(b.get('bb_at_bedtime'))} @ {_clock(b.get('bedtime_at'))}"
+    if b.get("drain_per_hr") is not None:
+        l2 += f" · −{b['drain_per_hr']}/h"
+    def below(key, thr):
+        if not b.get(key):
+            return f" · never <{thr}"
+        return f" · <{thr} all day" if b.get(key) == b.get("peak_time") else f" · <{thr} by {_clock(b[key])}"
+    l2 += below("below25_at", 25)
+    if b.get("below25_at"):
+        l2 += below("below15_at", 15)
+    if b.get("rest_recharge_min"):
+        l2 += f" · +{b['rest_recharge_min']} min rest"
+    return l1 + "\n" + l2 + "\n" + targets
+
+
+def battery_backfill(dry_run: bool = False) -> int:
+    """Fill the bat_* columns of existing history.csv rows from the raw cache (yesterday's timeline = the previous
+    day's raw file, or raw["stress_yesterday"] for newer files). No Garmin call. --dry-run prints only."""
+    rows = history_rows()
+    if not rows:
+        print("history.csv has no rows")
+        return 0
+    by_date = {r.get("date"): r for r in rows}
+    filled = skipped = 0
+    for r in rows:
+        try:
+            d = date.fromisoformat(r["date"])
+        except Exception:
+            continue
+        f = RAW_DIR / f"{d}.json"
+        if not f.exists():
+            skipped += 1
+            continue
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+            pf = RAW_DIR / f"{d - timedelta(days=1)}.json"
+            prev_raw = json.loads(pf.read_text(encoding="utf-8")) if pf.exists() else None
+        except Exception as e:
+            log.warning("backfill %s: raw unreadable (%s)", d, e)
+            skipped += 1
+            continue
+        prev_wake = (by_date.get((d - timedelta(days=1)).isoformat()) or {}).get("wake_time") or None
+        wb = r.get("bb_wake")
+        b = battery_metrics(raw, d, prev_raw, prev_wake, int(float(wb)) if wb else None)
+        if all(b.get(k) is None for k in BATTERY_HISTORY):
+            skipped += 1
+            print(f"{d}: no timeline data (raw has no stress/body_battery series)")
+            continue
+        for k, col in BATTERY_HISTORY.items():
+            r[col] = "" if b.get(k) is None else b[k]
+        filled += 1
+        print(f"{d}: charged {b.get('charged_overnight')} sleep {b.get('sleep_hours')} h | peak {b.get('peak_bb')} @ {_clock(b.get('peak_time'))} "
+              f"-> bed {b.get('bb_at_bedtime')} | drain {b.get('drain_per_hr')}/h | <25 {_clock(b.get('below25_at')) if b.get('below25_at') else 'never'} "
+              f"| <15 {_clock(b.get('below15_at')) if b.get('below15_at') else 'never'} | rest {b.get('rest_recharge_min')} min | awake {b.get('hours_awake')} h")
+    print(f"filled {filled}, skipped {skipped} of {len(rows)} rows")
+    if dry_run or DRY_RUN:
+        print("DRY RUN: nothing saved")
+        return 0
+    if filled:
+        fields = list(rows[0].keys())
+        for col in BATTERY_HISTORY.values():
+            if col not in fields:
+                fields.append(col)
+        with HISTORY_CSV.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in fields})
+        print(f"history.csv updated ({filled} rows)")
+    return 0
 
 
 def checkin_row(day: date, answers: Optional[Dict[str, Any]], started_at: Optional[datetime] = None,
@@ -1069,11 +1398,14 @@ def save(day: date, payload: Dict[str, Any], raw: Dict[str, Any]):
     fields = ["date", "tier", "bb_wake", "sleep_min", "sleep_score", "hrv_last_night", "hrv_status",
               "stress_avg_yesterday", "resting_hr", "readiness_score", "bedtime_target",
               "pressure_hpa", "pressure_d12_hpa", "pain_level",       # weather columns added 2026-10-23 (older rows blank)
-              "sleep_onset", "wake_time", "sleep_midpoint", "timing_source", "alcohol_drinks"]   # record-only, 2026-10-23
+              "sleep_onset", "wake_time", "sleep_midpoint", "timing_source", "alcohol_drinks",   # record-only, 2026-10-23
+              *BATTERY_HISTORY.values()]                                                          # battery block, 2026-10-26
     w = payload.get("weather") or {}
+    b = payload.get("battery") or {}
     row = {"date": str(day), "tier": payload["tier"], "bedtime_target": payload["circadian"]["bedtime_target"],
            "pressure_hpa": w.get("pressure_hpa"), "pressure_d12_hpa": w.get("d12_hpa"), "pain_level": w.get("pain_level"),
-           **{k: m.get(k) for k in fields if k in m}}
+           **{k: m.get(k) for k in fields if k in m},
+           **{col: b.get(k) for k, col in BATTERY_HISTORY.items()}}
     rows = []
     if HISTORY_CSV.exists():
         rows = [r for r in csv.DictReader(HISTORY_CSV.open(encoding="utf-8")) if r["date"] != str(day)]
@@ -1096,6 +1428,7 @@ def card(payload: Dict[str, Any]) -> str:
         f"{icon} CAPACITY {payload['tier']} — {payload['date']}{as_of_phrase(payload)}\n"
         f"Body Battery at wake: {m.get('bb_wake')}  |  Sleep {sleep} (score {m.get('sleep_score')}{src})\n"
         f"HRV {m.get('hrv_last_night')} ({m.get('hrv_status')})  |  RHR {m.get('resting_hr')}  |  Readiness {m.get('readiness_score')}\n"
+        f"{battery_lines(payload.get('battery'))}\n"
         f"{cpap_line(payload.get('cpap'))}\n"
         f"{sleepnumber_line(payload.get('sleepnumber'))}\n"
         f"{weather_line(payload.get('weather'))}\n"
@@ -1424,6 +1757,8 @@ def main() -> int:
     ap.add_argument("--no-extra", action="store_true", help="skip the myAir / SleepIQ fetch (Garmin only)")
     ap.add_argument("--no-weather", action="store_true", help="skip the Open-Meteo barometric-pain fetch")
     ap.add_argument("--weather", action="store_true", help="print today's weather / barometric pain object and exit")
+    ap.add_argument("--battery-backfill", action="store_true",
+                    help="fill the bat_* history.csv columns for past days from the raw cache (no Garmin call) and exit")
     a = ap.parse_args()
     global DRY_RUN
     DRY_RUN = bool(a.dry_run)                       # gates every write under data\ (see save / run_now / sources_extra)
@@ -1444,6 +1779,9 @@ def main() -> int:
 
     if a.now:
         return run_now(day, a.dry_run)
+
+    if a.battery_backfill:
+        return battery_backfill(a.dry_run)
 
     if a.weather:
         import sources_extra
@@ -1474,6 +1812,8 @@ def main() -> int:
         raw.update(MOCK_CASES[a.mock].get("raw", {}))
         if "overnight" in MOCK_CASES[a.mock]:
             raw["weigh_ins_range"] = mock_weigh_ins(day, **MOCK_CASES[a.mock]["overnight"])
+        if "battery" in MOCK_CASES[a.mock]:
+            raw.update(mock_battery_raw(day, **MOCK_CASES[a.mock]["battery"]))
     else:
         raw = None if a.refresh else cached_raw(day)
         if raw is None:
@@ -1510,6 +1850,19 @@ def main() -> int:
         checkin = {"day": str(day - timedelta(days=1)), **ck} if ck else None
     else:
         checkin = checkin_for_day(day - timedelta(days=1))                      # last evening's check-in (display only)
+    # Body Battery charge / drain block (display only): yesterday's timeline from raw["stress_yesterday"], else yesterday's raw file
+    prev_raw = prev_wake = None
+    if a.mock:
+        prev_wake = dig(raw, "_mock", "prev_wake")
+    else:
+        pf = RAW_DIR / f"{day - timedelta(days=1)}.json"
+        try:
+            prev_raw = json.loads(pf.read_text(encoding="utf-8")) if pf.exists() else None
+        except Exception:
+            prev_raw = None
+        prev_wake = next((r.get("wake_time") for r in history_rows() if r.get("date") == (day - timedelta(days=1)).isoformat()), None) or None
+    battery = battery_metrics(raw, day, prev_raw, prev_wake, metrics.get("bb_wake"))
+    battery["targets"] = battery_targets(day, metrics.get("bb_wake"), battery.get("low_bb"))
     cls = classify(metrics, cpap, sn, wx)
     tier = cls["tier"]
     payload = {
@@ -1526,6 +1879,7 @@ def main() -> int:
         "weather": wx,
         "overnight": overnight,
         "checkin": checkin,
+        "battery": battery,
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
