@@ -2,3 +2,12 @@
 data/
 __pycache__/
 *.pyc
+.env.*
+!.env.example
+tokens.json
+session.json
+*token*.json
+*session*.json
+.garminconnect/
+.myair/
+.sleepiq/
