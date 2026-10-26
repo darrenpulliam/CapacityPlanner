@@ -117,6 +117,13 @@ Nightly check-in (2026-10-25, display only; capacity_bot.py asks it with inline 
   data\\alcohol.csv (source "checkin"), so metrics.alcohol_drinks and the check-in agree. The morning run puts
   the previous evening's row in payload.checkin (lists for sites / types; null when none) and one card line
   "Check-in Sat 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
+--dry-run is write-free (2026-10-26): DRY_RUN gates every write under data\\ (raw cache, data\\<date>.json,
+  latest.json, history.csv, now\\*, now_latest*, the weather raw cache and location cache in sources_extra)
+  and prints "DRY RUN: nothing saved" after the payload. Auth / session files are exempt (Garmin tokens
+  refreshed by a SUCCESSFUL token login, myAir tokens.json, SleepIQ session.json): skipping them only forces
+  extra logins. A dry run never enters credential_fallback: a rejected Garmin token is an error (no relogin
+  state, no Telegram, the one-per-day credential attempt is kept for the real run). --setup still saves
+  (it is the day's one real fetch) but does not send.
 
 Requires: pip install --upgrade garminconnect curl_cffi python-dotenv requests asyncsleepiq
 """
@@ -147,6 +154,7 @@ CHECKIN_FIELDS = ["day", "status", "drinks", "new_wounds", "new_wound_count", "n
 CHECKIN_LIST_FIELDS = ("new_wound_sites", "exercise_types")   # stored ";"-joined, read back as lists
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
+DRY_RUN = False                # set by main() from --dry-run: no write under data\, no send (auth/session files exempt)
 
 WAKE_ANCHOR = "08:30"          # fixed every day — shift-work anchor (bed 12:15 AM / wake 8:30 AM), set 2026-10-07
 SLEEP_NEED_MIN = 480           # 8 h
@@ -322,6 +330,10 @@ def garmin_client(interactive: bool = False):
         token_err = f"{type(e).__name__}: {e}"
         log.warning("Garmin token rejected/missing in %s (%s)", TOKEN_DIR, token_err)
 
+    if DRY_RUN:
+        # Never burn the one-per-day credential attempt (or alert / write relogin state) from a dry run.
+        raise RuntimeError(f"dry run: Garmin token rejected ({token_err}); not attempting the credential "
+                           "re-login. Run without --dry-run, or: python garmin_capacity.py --setup")
     return credential_fallback(Garmin, token_err)
 
 
@@ -887,6 +899,7 @@ def run_overnight_update(day: date, dry_run: bool = False, client=None, now: Opt
     print(text)
     if dry_run:
         print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")
+        print("DRY RUN: nothing saved")
         return 0
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     raw.setdefault("_meta", {})["overnight_fetched_at"] = now.isoformat(timespec="seconds")
@@ -1042,6 +1055,10 @@ def circadian(day: date, tier: str, m: Dict[str, Any], sleep_debt_flag: bool = F
 
 # ───────────────────────────── outputs ─────────────────────────────
 def save(day: date, payload: Dict[str, Any], raw: Dict[str, Any]):
+    """Write raw\\<date>.json, <date>.json, latest.json and the history.csv row. No-op on --dry-run."""
+    if DRY_RUN:
+        log.info("DRY RUN: nothing saved (raw\\%s.json, %s.json, latest.json, history.csv untouched)", day, day)
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     (RAW_DIR / f"{day}.json").write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
@@ -1373,12 +1390,14 @@ def run_now(day: date, dry_run: bool) -> int:
     text = now_card(payload)
     print(text)
 
+    if dry_run:
+        print("<<<CAPACITY_NOW_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_NOW_JSON>>>")
+        print("DRY RUN: nothing saved")
+        return 0
     NOW_DIR.mkdir(parents=True, exist_ok=True)
     (NOW_DIR / f"{day}_{at.strftime('%H%M')}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     (DATA_DIR / "now_latest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     (DATA_DIR / "now_latest.raw.json").write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
-    if dry_run:
-        return 0
 
     subject = f"[CAPACITY-NOW] {day} {at.strftime('%H:%M')} BB{metrics.get('bb_now')}"
     tg = send_telegram(text)
@@ -1406,6 +1425,9 @@ def main() -> int:
     ap.add_argument("--no-weather", action="store_true", help="skip the Open-Meteo barometric-pain fetch")
     ap.add_argument("--weather", action="store_true", help="print today's weather / barometric pain object and exit")
     a = ap.parse_args()
+    global DRY_RUN
+    DRY_RUN = bool(a.dry_run)                       # gates every write under data\ (see save / run_now / sources_extra)
+    no_send = False                                 # --setup: save (the day's one real fetch) but do not publish
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_env()
@@ -1425,6 +1447,7 @@ def main() -> int:
 
     if a.weather:
         import sources_extra
+        sources_extra.DRY_RUN = DRY_RUN
         wx = sources_extra.fetch_weather(day, WEATHER_THRESHOLDS)
         print(weather_line(wx))
         print(json.dumps(wx, indent=2))
@@ -1438,8 +1461,8 @@ def main() -> int:
     if a.setup:
         garmin_client(interactive=True)
         print(f"Garmin login OK — tokens stored in {TOKEN_DIR}. Daily runs are now non-interactive.")
-        a.dry_run = True
-        a.refresh = True  # the setup run is the day's one real fetch
+        no_send = True
+        a.refresh = True  # the setup run is the day's one real fetch: saved (not a dry run), not sent
 
     if not a.mock and not a.refresh and published(day):
         # 12:15 trigger (or any plain re-run) on a day that is already out: weigh-ins only, re-send only on change.
@@ -1469,6 +1492,7 @@ def main() -> int:
     else:
         try:   # all fetches are best-effort inside sources_extra; this guard covers an import error too
             import sources_extra
+            sources_extra.DRY_RUN = DRY_RUN                             # weather raw / location caches live under data\
             if not a.no_extra:
                 cpap = sources_extra.fetch_cpap(day)
                 sn = sources_extra.fetch_sleepnumber(day)
@@ -1509,9 +1533,11 @@ def main() -> int:
     print(text)
 
     if not a.mock:
-        save(day, payload, raw)
-    if a.dry_run or a.mock:
+        save(day, payload, raw)                                         # no-op on --dry-run
+    if a.dry_run or a.mock or no_send:
         print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")   # what the mail would carry
+        if a.dry_run:
+            print("DRY RUN: nothing saved")
         return 0
 
     tg = send_telegram(text)

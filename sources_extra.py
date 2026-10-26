@@ -444,6 +444,8 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_LOCATION_FILE = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data"))) / ".weather_location.json"
 WEATHER_RAW_DIR = Path(os.getenv("CAPACITY_DATA_DIR", str(BASE_DIR / "data"))) / "raw"
+DRY_RUN = False   # set by garmin_capacity --dry-run: skip the data\ caches below (weather raw / location).
+                  # Auth / session files (myAir tokens.json, SleepIQ session.json) are NOT gated: they are not data.
 WEATHER_ANCHOR_HM = "08:30"     # for a past --date: evaluate the pressure window from this wake time
 WEATHER_BACK_H = 12             # window span: this many hours before the anchor ...
 WEATHER_AHEAD_H = 24            # ... to this many hours after it (today's fronts count, tonight's too)
@@ -485,7 +487,10 @@ def weather_location() -> Optional[Dict[str, Any]]:
     loc = {"place": place, "lat": hit["latitude"], "lon": hit["longitude"],
            "name": ", ".join(str(x) for x in (hit.get("name"), hit.get("admin1"), hit.get("country_code")) if x),
            "timezone": hit.get("timezone"), "saved_at": datetime.now().isoformat(timespec="seconds")}
-    _write_json(WEATHER_LOCATION_FILE, loc)
+    if DRY_RUN:
+        log.info("weather: DRY RUN — location cache not written")
+    else:
+        _write_json(WEATHER_LOCATION_FILE, loc)
     log.info("weather: geocoded %r -> %s (%.4f, %.4f)", place, loc["name"], loc["lat"], loc["lon"])
     return loc
 
@@ -545,12 +550,15 @@ def fetch_weather(day: date, thresholds: Dict[str, float], at: Optional[datetime
         j = r.json()
         if j.get("error"):
             raise RuntimeError(f"Open-Meteo: {j.get('reason')}")
-        try:
-            WEATHER_RAW_DIR.mkdir(parents=True, exist_ok=True)
-            _write_json(WEATHER_RAW_DIR / f"weather_{day}.json", {"_meta": {"fetched_at": datetime.now().isoformat(timespec="seconds"),
-                                                                           "anchor": anchor.isoformat(), "location": loc}, **j})
-        except Exception as e:
-            log.warning("weather: raw save failed: %s", e)
+        if DRY_RUN:
+            log.info("weather: DRY RUN — raw cache not written")
+        else:
+            try:
+                WEATHER_RAW_DIR.mkdir(parents=True, exist_ok=True)
+                _write_json(WEATHER_RAW_DIR / f"weather_{day}.json", {"_meta": {"fetched_at": datetime.now().isoformat(timespec="seconds"),
+                                                                               "anchor": anchor.isoformat(), "location": loc}, **j})
+            except Exception as e:
+                log.warning("weather: raw save failed: %s", e)
         h = j.get("hourly") or {}
         times = [datetime.fromisoformat(t) for t in h.get("time") or []]
         press = h.get("pressure_msl") or []
