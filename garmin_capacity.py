@@ -1180,6 +1180,25 @@ def checkin_line(c: Optional[Dict[str, Any]]) -> str:
     return f"{lbl}: " + " · ".join(parts)
 
 
+def attach_checkin_bot(payload: Dict[str, Any]) -> None:
+    """Add last night's checkin_bot record (+ its one-line summary) as payload["checkin_bot"]. Never raises.
+    (payload["checkin"] stays the capacity_bot.py checkin.csv row that checkin_line() renders.)"""
+    try:
+        from checkin_bot import last_night_summary, last_night_record
+        rec = last_night_record()
+        rec["summary"] = last_night_summary()
+        payload["checkin_bot"] = rec
+    except Exception as e:
+        log.warning("checkin unavailable: %s", e)
+
+
+def card_with_checkin(payload: Dict[str, Any]) -> str:
+    """card() plus the checkin_bot summary line when the payload carries one."""
+    text = card(payload)
+    line = (payload.get("checkin_bot") or {}).get("summary")
+    return text + chr(10) + line if line else text
+
+
 def published(day: date) -> Optional[Dict[str, Any]]:
     """The day's saved payload when the morning run already published it (tier not UNKNOWN), else None."""
     f = DATA_DIR / f"{day}.json"
@@ -1224,7 +1243,7 @@ def run_overnight_update(day: date, dry_run: bool = False, client=None, now: Opt
         new["fetched_at"] = now.isoformat(timespec="minutes")
     payload["overnight"] = new
     payload["overnight_updated_at"] = now.isoformat(timespec="seconds")
-    text = card(payload)
+    text = card_with_checkin(payload)       # the morning run's saved checkin_bot summary line, if any
     print(text)
     if dry_run:
         print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")
@@ -1883,7 +1902,8 @@ def main() -> int:
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
-    text = card(payload)
+    attach_checkin_bot(payload)
+    text = card_with_checkin(payload)
     print(text)
 
     if not a.mock:
