@@ -45,6 +45,8 @@ import argparse
 import json
 import logging
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -70,9 +72,12 @@ COMMANDS = [
     {"command": "today", "description": "This morning's capacity card"},
     {"command": "drinks", "description": "Log alcohol: /drinks N [M/D] (0-10; before 2 PM = last night)"},
     {"command": "checkin", "description": "Nightly check-in now: drinks, new/older wounds, exercise (buttons)"},
+    {"command": "sweat", "description": "Night-sweat question for last night (buttons)"},
+    {"command": "drink", "description": "Log a drink now (or just text: beer, 2 wine, bourbon)"},
+    {"command": "undo", "description": "Remove the last drink you texted"},
     {"command": "help", "description": "List the commands"},
 ]
-HINT = "Unknown command. Try /capacity, /today, /drinks, /checkin or /help."
+HINT = "Unknown command. Try /capacity, /today, /drinks, /drink, /undo, /checkin, /sweat or /help."
 DRINKS_USAGE = ("Usage: /drinks N [M/D]  — N = 0-10 drinks (halves OK, e.g. 1.5). "
                 "Before 2 PM it counts for last night, from 2 PM on for tonight; add a date to override: /drinks 2 10/22")
 
@@ -323,7 +328,9 @@ CHECKIN_TIME = os.getenv("CHECKIN_TIME", "23:15")   # wind-down start, HH:MM loc
 CHECKIN_NUDGE_MIN = 45                               # one nudge this long after the last prompt / answer ...
 CHECKIN_SKIP_MIN = 90                                # ... and logged as skipped this long after it (45 min past the nudge)
 CHECKIN_WINDOW_H = 6                                 # a missed start (bot down) is still made up this long after CHECKIN_TIME
-CHECKIN_STATE_FILE = DATA_DIR / "checkin_state.json"
+CHECKIN_STATE_FILE = DATA_DIR / "capacity_checkin_state.json"   # this bot only (checkin_state.json belonged to the retired checkin_bot)
+SWEAT_NUDGE_MIN = 45                                  # one nudge this long after the morning night-sweat prompt
+SWEAT_LABEL = {"none": "No sweating", "damp": "Damp (clothes/pillow)", "soaked": "Soaked the sheets"}
 WOUND_SITES = ["Face/mouth", "Scalp", "Hands/arms", "Legs/feet", "Torso/back", "Other"]
 EXERCISE_TYPES = ["Strength training", "Treadmill", "Walking outside", "Elliptical", "Biking", "Hiking"]
 EXERCISE_MINUTES = ["<15", "15-30", "30-60", "60+"]
@@ -336,7 +343,8 @@ CHECKIN_FIELD = {"drinks": "drinks", "wounds_new": "new_wounds", "wounds_count":
                  "wounds_older": "older_wounds", "exercise": "exercise", "exercise_minutes": "exercise_minutes"}
 CHECKIN_LABEL = {"0": "None", "no": "No", "yes": "Yes", "none": "None open", "healing": "Healing", "worse": "Getting worse"}
 
-_session: Optional[Dict[str, Any]] = None   # the one in-flight check-in (owner chat only)
+_session: Optional[Dict[str, Any]] = None   # the one in-flight evening check-in (owner chat only)
+_sweat: Optional[Dict[str, Any]] = None     # the one in-flight morning night-sweat question
 
 
 def checkin_day(now: datetime) -> date:
@@ -388,21 +396,26 @@ def checkin_question(s: Dict[str, Any]):
 
 def _save_session() -> None:
     try:
-        CHECKIN_STATE_FILE.write_text(json.dumps(_session or {}), encoding="utf-8")
+        CHECKIN_STATE_FILE.write_text(json.dumps({"evening": _session, "sweat": _sweat}), encoding="utf-8")
     except Exception as e:
         log.warning("check-in state write failed: %s", e)
 
 
 def _load_session() -> None:
-    global _session
+    global _session, _sweat
+    _session = _sweat = None
     try:
         s = json.loads(CHECKIN_STATE_FILE.read_text(encoding="utf-8")) if CHECKIN_STATE_FILE.exists() else {}
-        _session = s if s and s.get("step") else None
+        ev, sw = s.get("evening"), s.get("sweat")
+        _session = ev if ev and ev.get("step") else None
+        _sweat = sw if sw and sw.get("day") else None
         if _session:
             log.info("check-in for %s resumed at step %s", _session["day"], _session["step"])
+        if _sweat:
+            log.info("night-sweat question for %s resumed", _sweat["day"])
     except Exception as e:
         log.warning("check-in state unreadable (%s); starting without one", e)
-        _session = None
+        _session = _sweat = None
 
 
 def _ask(s: Dict[str, Any], now: datetime, reset_clock: bool = True) -> None:
@@ -506,6 +519,8 @@ def handle_callback(cq: Dict[str, Any], owner: str, now: Optional[datetime] = No
         _answer_cb(cq.get("id"))
         return "cb_unknown"
     step, value = parts[1], parts[2]
+    if step == "sweat":
+        return _sweat_callback(cq, chat_id, value, now)
     s = _session
     if not s or str(s.get("chat_id")) != str(chat_id) or s.get("step") != step:
         _answer_cb(cq.get("id"), "That check-in step is already finished — /checkin to redo it.")
@@ -561,7 +576,7 @@ def checkin_tick(owner: str, now: Optional[datetime] = None) -> str:
             return "waiting"
         day = checkin_day(now)
         start = _scheduled_start(day)
-        if start <= now < start + timedelta(hours=CHECKIN_WINDOW_H) and gc.checkin_for_day(day) is None:
+        if start <= now < start + timedelta(hours=CHECKIN_WINDOW_H) and not (gc.checkin_for_day(day) or {}).get("status"):
             start_checkin(int(owner), now, trigger="scheduled")
             return "started"
         return "idle"
@@ -577,6 +592,209 @@ def cmd_checkin(chat_id, now: Optional[datetime] = None) -> str:
         return "checkin_resend"
     start_checkin(chat_id, now, trigger="command")
     return "checkin_start"
+
+
+# ───────────────────────────── morning night-sweat question ─────────────────────────────
+def morning_time() -> str:
+    return os.getenv("MORNING_TIME", "08:35")           # HH:MM local; the prompt for the night that just ended
+
+
+def sweat_night(now: datetime) -> date:
+    """The evening date of the night that just ended: yesterday (before 04:00, still up from the prior evening: two days ago)."""
+    return now.date() - timedelta(days=2 if now.hour < 4 else 1)
+
+
+def sweat_for_day(day: date) -> str:
+    return (gc.checkin_for_day(day) or {}).get("night_sweat") or ""
+
+
+def _sweat_rows():
+    return [[(lbl, f"ci|sweat|{k}")] for k, lbl in SWEAT_LABEL.items()]
+
+
+def _sweat_ask(s: Dict[str, Any], now: datetime, reset_clock: bool = True) -> None:
+    d = date.fromisoformat(s["day"])
+    s["q_text"] = f"Morning check - night of {_day_label(d)}: did you sweat in your sleep?"
+    try:
+        r = api("sendMessage", {"chat_id": s["chat_id"], "text": s["q_text"], "reply_markup": _kb(_sweat_rows())})
+        s["msg_id"] = (r or {}).get("message_id")
+    except Exception as e:
+        log.warning("night-sweat question failed: %s", e)
+        s["msg_id"] = None
+    if reset_clock:
+        s["last_prompt_at"] = now.isoformat(timespec="seconds")
+        s["nudged"] = False
+    _save_session()
+
+
+def start_sweat(chat_id, now: Optional[datetime] = None, trigger: str = "command") -> None:
+    global _sweat
+    now = now or datetime.now()
+    _sweat = {"day": sweat_night(now).isoformat(), "chat_id": chat_id, "started_at": now.isoformat(timespec="seconds"),
+              "msg_id": None, "q_text": "", "last_prompt_at": now.isoformat(timespec="seconds"), "nudged": False,
+              "trigger": trigger}
+    log.info("night-sweat question %s started (%s)", _sweat["day"], trigger)
+    _sweat_ask(_sweat, now)
+
+
+def finish_sweat(s: Dict[str, Any], now: datetime, value: str) -> None:
+    """Write a sweat-only row (trigger "sweat"): checkin_for_day merges it, the evening answers stay untouched."""
+    global _sweat
+    day = date.fromisoformat(s["day"])
+    row = gc.checkin_row(day, {"night_sweat": value}, started_at=datetime.fromisoformat(s["started_at"]), finished_at=now,
+                         status="", trigger="sweat", source="telegram")
+    try:
+        gc.checkin_log(row)
+    except Exception as e:
+        log.warning("night-sweat log write failed: %s: %s", type(e).__name__, e)
+    log.info("night sweat %s: %s", s["day"], value)
+    _sweat = None
+    _save_session()
+
+
+def _sweat_callback(cq: Dict[str, Any], chat_id, value: str, now: datetime) -> str:
+    s = _sweat
+    if not s or str(s.get("chat_id")) != str(chat_id) or value not in SWEAT_LABEL:
+        _answer_cb(cq.get("id"), "That question is already closed - /sweat to redo it.")
+        return "cb_stale"
+    _answer_cb(cq.get("id"))
+    _edit(chat_id, s.get("msg_id"), text=f"{s.get('q_text', '')}\n✓ {SWEAT_LABEL[value]}")
+    day = date.fromisoformat(s["day"])
+    finish_sweat(s, now, value)
+    send(chat_id, f"Saved: {_day_label(day)} night sweat - {SWEAT_LABEL[value].lower()}.")
+    return "sweat_done"
+
+
+def sweat_tick(owner: str, now: Optional[datetime] = None) -> str:
+    """Every poll cycle: nudge / skip the open morning question, or start it at MORNING_TIME (before 14:00 only,
+    and only while that night has no answer yet). Never raises."""
+    now = now or datetime.now()
+    try:
+        s = _sweat
+        if s:
+            deadline = datetime.combine(date.fromisoformat(s["day"]) + timedelta(days=1), datetime.min.time()).replace(hour=gc.ALCOHOL_CUTOVER_H)
+            if now >= deadline:
+                _edit(s["chat_id"], s.get("msg_id"), text=f"{s.get('q_text', '')}\n(no answer - logged as skipped)")
+                finish_sweat(s, now, "skipped")
+                return "sweat_skipped"
+            idle_min = (now - datetime.fromisoformat(s["last_prompt_at"])).total_seconds() / 60
+            if not s.get("nudged") and idle_min >= SWEAT_NUDGE_MIN:
+                send(s["chat_id"], "Quick one: night sweats last night? One tap.")
+                _sweat_ask(s, now, reset_clock=False)
+                s["nudged"] = True
+                _save_session()
+                return "sweat_nudged"
+            return "sweat_waiting"
+        h, m = map(int, morning_time().split(":"))
+        if (now.replace(hour=h, minute=m, second=0, microsecond=0) <= now and now.hour < gc.ALCOHOL_CUTOVER_H
+                and not sweat_for_day(sweat_night(now))):
+            start_sweat(int(owner), now, trigger="scheduled")
+            return "sweat_started"
+        return "idle"
+    except Exception as e:
+        log.warning("night-sweat tick failed: %s: %s", type(e).__name__, e)
+        return "error"
+
+
+def cmd_sweat(chat_id, now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    if _sweat and str(_sweat.get("chat_id")) == str(chat_id):
+        _sweat_ask(_sweat, now)
+        return "sweat_resend"
+    start_sweat(chat_id, now, trigger="command")
+    return "sweat_start"
+
+
+# ───────────────────────────── free-text drinks ─────────────────────────────
+DRINK_RE = re.compile(r"\b(beers?|wines?|drinks?|shots?|cocktails?|bourbons?|whiske?y|"
+                      r"liquor|seltzers?|margaritas?|ciders?)\b")
+
+
+def parse_drink_text(text: str, command: bool = False):
+    """'beer' / '2 wine' / 'bourbon' -> (count, what); '/drink' -> (1, 'drink'); anything else -> None."""
+    t = (text or "").lower().strip()
+    if command:
+        t = t.split(None, 1)[1].strip() if len(t.split(None, 1)) > 1 else ""
+        t = t or "drink"
+    m = DRINK_RE.search(t)
+    n = re.search(r"\b(\d{1,2})\b", t)
+    if not m and not (command and n):
+        return None
+    count = int(n.group(1)) if n else 1
+    if not 1 <= count <= 12:
+        return None
+    what = m.group(1) if m else "drink"
+    if what.endswith("s") and what != "whiskys":
+        what = what[:-1]
+    return count, what
+
+
+def cmd_drink_text(text: str, now: Optional[datetime] = None, command: bool = False) -> Optional[str]:
+    """Log one free-text drink event + bump that night's total in alcohol.csv. None = not a drink message."""
+    now = now or datetime.now()
+    parsed = parse_drink_text(text, command)
+    if not parsed:
+        return None
+    count, what = parsed
+    night = checkin_day(now)
+    try:
+        gc.drink_event_log(night, count, what, at=now)
+        total = min(gc.ALCOHOL_MAX_DRINKS, (gc.alcohol_for_night(night) or 0) + count)
+        gc.alcohol_log(night, total, source="text", at=now)
+    except Exception as e:
+        log.warning("drink event write failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not log the drink ({type(e).__name__})."
+    return f"Logged {count} {what} at {now.strftime('%I:%M %p').lstrip('0')}. {_day_label(night)}: {total:g} total."
+
+
+def cmd_undo(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    try:
+        last = gc.drink_undo(now)
+        if not last:
+            return "Nothing to undo."
+        night = date.fromisoformat(last["night_date"])
+        total = max(0.0, (gc.alcohol_for_night(night) or 0) - last["count"])
+        gc.alcohol_log(night, total, source="undo", at=now)
+    except Exception as e:
+        log.warning("undo failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not undo ({type(e).__name__})."
+    return f"Removed {last['count']:g} {last['what']}. {_day_label(night)}: {total:g} total."
+
+
+# ───────────────────────────── one-time import from the retired checkin_bot ─────────────────────────────
+def import_checkins_jsonl(path: Optional[Path] = None, archive: bool = True) -> Dict[str, int]:
+    """data/checkins.jsonl -> night_sweat rows in checkin.csv + drink_events.csv. Idempotent (a night that already has a
+    sweat answer, or a drink event with the same ts, is skipped). Then moves the file to data/archive/."""
+    path = path or DATA_DIR / "checkins.jsonl"
+    out = {"sweat": 0, "drinks": 0, "skipped": 0}
+    if not path.exists():
+        return out
+    have_ts = {e["ts"] for e in gc.drink_events()}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(line)
+            day = date.fromisoformat(r["day"])
+            ts = datetime.fromisoformat(r["ts"])
+        except Exception:
+            out["skipped"] += 1
+            continue
+        if r.get("type") == "morning":
+            val = "skipped" if r.get("skipped") else r.get("sweat")
+            if val and not sweat_for_day(day):
+                gc.checkin_log(gc.checkin_row(day, {"night_sweat": val}, finished_at=ts, status="", trigger="sweat", source="import"))
+                out["sweat"] += 1
+        elif r.get("type") == "drink" and r.get("count", 0) > 0 and r["ts"] not in have_ts:
+            gc.drink_event_log(day, r["count"], r.get("what", "drink"), at=ts)
+            out["drinks"] += 1
+    if archive:
+        dest_dir = DATA_DIR / "archive"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        if dest.exists():
+            dest = dest_dir / f"{path.stem}.{datetime.now():%Y%m%d%H%M%S}{path.suffix}"
+        shutil.move(str(path), str(dest))
+    return out
 
 
 def checkin_log_cli(args: List[str]) -> int:
@@ -609,7 +827,9 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
         return "ignored_non_owner"
     cmd = parse_command(message.get("text") or "")
     if cmd is None:
-        return "ignored_text"
+        if not parse_drink_text(message.get("text") or ""):
+            return "ignored_text"
+        cmd = "drink_text"
     age = (now or time.time()) - float(message.get("date") or 0)
     if age > STALE_S:
         send(chat_id, f"Skipped /{cmd} sent {int(age // 60)} min ago while I was offline. Send it again.")
@@ -623,6 +843,15 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
         args = (message.get("text") or "").strip().split(None, 1)
         send(chat_id, cmd_drinks(args[1] if len(args) > 1 else ""))
         return "drinks"
+    if cmd in ("drink", "drink_text"):
+        reply = cmd_drink_text(message.get("text") or "", datetime.fromtimestamp(now) if now else None, command=(cmd == "drink"))
+        send(chat_id, reply or "Try: /drink, or /drink 2 wine (or just text: beer, 2 wine, bourbon).")
+        return "drink_text"
+    if cmd == "undo":
+        send(chat_id, cmd_undo(datetime.fromtimestamp(now) if now else None))
+        return "undo"
+    if cmd == "sweat":
+        return cmd_sweat(chat_id, datetime.fromtimestamp(now) if now else None)
     if cmd == "checkin":
         return cmd_checkin(chat_id, datetime.fromtimestamp(now) if now else None)
     if cmd in ("help", "start"):
@@ -657,6 +886,9 @@ def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
     tick = checkin_tick(owner)
     if tick not in ("idle", "waiting"):
         last_cmd = f"checkin_{tick}"
+    stick = sweat_tick(owner)
+    if stick not in ("idle", "sweat_waiting"):
+        last_cmd = stick
     write_heartbeat(offset, last_cmd)
     return offset
 
@@ -666,7 +898,12 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="one poll cycle, then exit")
     ap.add_argument("--checkin-log", nargs="+", metavar="ARG",
                     help="append a check-in row and exit: --checkin-log YYYY-MM-DD field=value ... (backfill)")
+    ap.add_argument("--import-checkins", action="store_true",
+                    help="one-time: import data/checkins.jsonl (retired checkin_bot) and archive it, then exit")
     a = ap.parse_args()
+    if a.import_checkins:
+        print("imported:", import_checkins_jsonl())
+        return 0
     if a.checkin_log:
         return checkin_log_cli(a.checkin_log)
     fmt = logging.Formatter("%(asctime)s %(levelname)s capacity_bot %(message)s")

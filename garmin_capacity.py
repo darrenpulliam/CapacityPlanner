@@ -117,6 +117,10 @@ Nightly check-in (2026-10-25, display only; capacity_bot.py asks it with inline 
   data\\alcohol.csv (source "checkin"), so metrics.alcohol_drinks and the check-in agree. The morning run puts
   the previous evening's row in payload.checkin (lists for sites / types; null when none) and one card line
   "Check-in Sat 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
+  2026-10-26 consolidation (checkin_bot retired): data\\checkin.csv gains night_sweat (none|damp|soaked|skipped; the
+  08:35 morning question, stored as its own row with trigger "sweat" and MERGED by checkin_for_day, never replacing
+  the evening answers); free-text drinks go to data\\drink_events.csv (+ the night total in alcohol.csv) and
+  payload.checkin.last_drink_time feeds the card's "drinks 2 (last 10:40 PM)".
 Body Battery charge / drain block (2026-10-26, display only): payload.battery = {charged_overnight (BB at wake -
   BB at last night's sleep start; fallback Garmin's bodyBatteryDuringSleep), sleep_hours, wake_bb, peak_bb /
   peak_time, low_bb / low_time (yesterday's awake window), bb_at_bedtime, hours_awake (yesterday's wake -> sleep
@@ -168,8 +172,10 @@ BATTERY_HISTORY = {"charged_overnight": "bat_charged", "sleep_hours": "bat_sleep
                    "bb_at_bedtime": "bat_bedtime_bb", "hours_awake": "bat_hours_awake", "drain_per_hr": "bat_drain_per_hr",
                    "below25_at": "bat_below25_at", "below15_at": "bat_below15_at", "rest_recharge_min": "bat_rest_recharge_min"}
 BB_GAP_MAX_MIN = 20                          # timeline gaps longer than this are not counted as recharge
+DRINK_EVENTS_CSV = DATA_DIR / "drink_events.csv"   # ts,night_date,count,what — free-text drinks; count < 0 = /undo of the last one
 CHECKIN_FIELDS = ["day", "status", "drinks", "new_wounds", "new_wound_count", "new_wound_sites", "older_wounds",
-                  "exercise", "exercise_types", "exercise_minutes", "started_at", "finished_at", "trigger", "source"]
+                  "exercise", "exercise_types", "exercise_minutes", "started_at", "finished_at", "trigger", "source",
+                  "night_sweat"]                                   # night_sweat: none|damp|soaked|skipped, set by the next morning's row
 CHECKIN_LIST_FIELDS = ("new_wound_sites", "exercise_types")   # stored ";"-joined, read back as lists
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
@@ -1100,8 +1106,22 @@ def checkin_row(day: date, answers: Optional[Dict[str, Any]], started_at: Option
 
 
 def checkin_log(row: Dict[str, Any]) -> None:
-    """Append one row to data\\checkin.csv (header on first write). Re-doing a day appends; readers take the LAST row."""
+    """Append one row to data\\checkin.csv (header on first write; an older header is migrated in place so new columns
+    such as night_sweat line up). Re-doing a day appends; readers merge (see checkin_for_day)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if CHECKIN_CSV.exists() and CHECKIN_CSV.stat().st_size > 0:
+        with CHECKIN_CSV.open(encoding="utf-8", newline="") as f:
+            old = list(csv.DictReader(f))
+        with CHECKIN_CSV.open(encoding="utf-8", newline="") as f:
+            hdr = next(csv.reader(f), [])
+        if hdr != CHECKIN_FIELDS:
+            tmp = CHECKIN_CSV.with_suffix(".tmp")
+            with tmp.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=CHECKIN_FIELDS)
+                w.writeheader()
+                for r in old:
+                    w.writerow({k: r.get(k, "") or "" for k in CHECKIN_FIELDS})
+            tmp.replace(CHECKIN_CSV)
     new = not CHECKIN_CSV.exists() or CHECKIN_CSV.stat().st_size == 0
     with CHECKIN_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CHECKIN_FIELDS)
@@ -1111,24 +1131,81 @@ def checkin_log(row: Dict[str, Any]) -> None:
 
 
 def checkin_for_day(day: date) -> Optional[Dict[str, Any]]:
-    """Last check-in row for `day` (the evening's date) with list fields split, or None. Never raises."""
+    """The day's check-in with list fields split, or None. Evening answers = the LAST evening row (a re-done check-in
+    replaces the old one whole); night_sweat = the last non-empty value from ANY row for that day, so a morning
+    (trigger "sweat") row adds the sweat answer without blanking the evening's. last_drink_time = the last remaining
+    free-text drink for that evening (ISO) or "". Never raises."""
     try:
         if not CHECKIN_CSV.exists():
             return None
-        row = None
+        ev = None
+        sweat = ""
         with CHECKIN_CSV.open(encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
-                if r.get("day") == day.isoformat():
-                    row = r
-        if row is None:
+                if r.get("day") != day.isoformat():
+                    continue
+                if (r.get("trigger") or "") != "sweat":
+                    ev = r
+                if r.get("night_sweat"):
+                    sweat = r["night_sweat"]
+        if ev is None and not sweat:
             return None
-        out = {k: (row.get(k) or "") for k in CHECKIN_FIELDS}
+        out = {k: ((ev or {}).get(k) or "") for k in CHECKIN_FIELDS}
+        out["day"], out["night_sweat"] = day.isoformat(), sweat
         for k in CHECKIN_LIST_FIELDS:
             out[k] = [x for x in out[k].split(";") if x]
+        out["last_drink_time"] = last_drink_time(day)
         return out
     except Exception as e:
         log.warning("check-in log unreadable: %s: %s", type(e).__name__, e)
         return None
+
+
+def drink_event_log(night: date, count: float, what: str, at: Optional[datetime] = None) -> None:
+    """Append one free-text drink (count > 0) or an undo (count < 0) to data\\drink_events.csv."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new = not DRINK_EVENTS_CSV.exists() or DRINK_EVENTS_CSV.stat().st_size == 0
+    with DRINK_EVENTS_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["ts", "night_date", "count", "what"])
+        w.writerow([(at or datetime.now()).isoformat(timespec="seconds"), night.isoformat(), f"{count:g}", what])
+
+
+def drink_events() -> List[Dict[str, Any]]:
+    """Free-text drinks still standing (each undo row removes the latest earlier event of that night), oldest first."""
+    out: List[Dict[str, Any]] = []
+    try:
+        if not DRINK_EVENTS_CSV.exists():
+            return out
+        with DRINK_EVENTS_CSV.open(encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                c = float(r["count"])
+                if c > 0:
+                    out.append({"ts": r["ts"], "night_date": r["night_date"], "count": c, "what": r.get("what", "")})
+                else:
+                    for i in range(len(out) - 1, -1, -1):
+                        if out[i]["night_date"] == r["night_date"]:
+                            out.pop(i)
+                            break
+    except Exception as e:
+        log.warning("drink events unreadable: %s: %s", type(e).__name__, e)
+    return out
+
+
+def drink_undo(at: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """Remove the most recent standing free-text drink (appends an undo row). Returns it, or None when there is none."""
+    ev = drink_events()
+    if not ev:
+        return None
+    last = ev[-1]
+    drink_event_log(date.fromisoformat(last["night_date"]), -last["count"], last["what"], at=at)
+    return last
+
+
+def last_drink_time(night: date) -> str:
+    ev = [e["ts"] for e in drink_events() if e["night_date"] == night.isoformat()]
+    return ev[-1] if ev else ""
 
 
 def checkin_drinks_value(v: Any) -> Optional[float]:
@@ -1155,7 +1232,13 @@ def checkin_line(c: Optional[Dict[str, Any]]) -> str:
         lbl += " (skipped)"
     parts = []
     dr = (c.get("drinks") or "").strip()
-    parts.append("drinks none" if dr == "0" else f"drinks {dr}" if dr and dr != "unknown" else "drinks ?")
+    dpart = "drinks none" if dr == "0" else f"drinks {dr}" if dr and dr != "unknown" else "drinks ?"
+    try:
+        if c.get("last_drink_time"):
+            dpart += " (last " + datetime.fromisoformat(c["last_drink_time"]).strftime("%I:%M %p").lstrip("0") + ")"
+    except Exception:
+        pass
+    parts.append(dpart)
     nw = (c.get("new_wounds") or "").lower()
     if nw == "yes":
         n = (c.get("new_wound_count") or "").strip()
@@ -1177,26 +1260,9 @@ def checkin_line(c: Optional[Dict[str, Any]]) -> str:
         parts.append("no exercise")
     else:
         parts.append("exercise ?")
+    sw = {"none": "none", "damp": "damp", "soaked": "soaked sheets"}.get((c.get("night_sweat") or "").lower())
+    parts.append(f"night sweat: {sw}" if sw else "night sweat ?")
     return f"{lbl}: " + " · ".join(parts)
-
-
-def attach_checkin_bot(payload: Dict[str, Any]) -> None:
-    """Add last night's checkin_bot record (+ its one-line summary) as payload["checkin_bot"]. Never raises.
-    (payload["checkin"] stays the capacity_bot.py checkin.csv row that checkin_line() renders.)"""
-    try:
-        from checkin_bot import last_night_summary, last_night_record
-        rec = last_night_record()
-        rec["summary"] = last_night_summary()
-        payload["checkin_bot"] = rec
-    except Exception as e:
-        log.warning("checkin unavailable: %s", e)
-
-
-def card_with_checkin(payload: Dict[str, Any]) -> str:
-    """card() plus the checkin_bot summary line when the payload carries one."""
-    text = card(payload)
-    line = (payload.get("checkin_bot") or {}).get("summary")
-    return text + chr(10) + line if line else text
 
 
 def published(day: date) -> Optional[Dict[str, Any]]:
@@ -1243,7 +1309,7 @@ def run_overnight_update(day: date, dry_run: bool = False, client=None, now: Opt
         new["fetched_at"] = now.isoformat(timespec="minutes")
     payload["overnight"] = new
     payload["overnight_updated_at"] = now.isoformat(timespec="seconds")
-    text = card_with_checkin(payload)       # the morning run's saved checkin_bot summary line, if any
+    text = card(payload)
     print(text)
     if dry_run:
         print("<<<CAPACITY_JSON" + chr(10) + json.dumps(payload, indent=2) + chr(10) + "CAPACITY_JSON>>>")
@@ -1902,8 +1968,7 @@ def main() -> int:
         "source": "mock" if a.mock else "garmin",
         "fetched_at": dig(raw, "_meta", "fetched_at"),
     }
-    attach_checkin_bot(payload)
-    text = card_with_checkin(payload)
+    text = card(payload)
     print(text)
 
     if not a.mock:
