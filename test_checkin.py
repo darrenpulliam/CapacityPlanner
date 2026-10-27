@@ -76,6 +76,10 @@ class Checkin(unittest.TestCase):
         t = T2315
         self.assertEqual(bot.handle_callback(cq("drinks", "2"), OWNER, t), "cb_drinks")
         self.assertIn("✓ 2", [p.get("text", "") for m, p in self.api.calls if m == "editMessageText"][-1])
+        self.assertIn("2/5  Any gluten today?", self.api.texts()[-1])
+        self.assertEqual(self.api.buttons(), ["No", "Yes", "Not sure"])
+        self.assertEqual(bot.handle_callback(cq("gluten", "yes"), OWNER, t), "cb_gluten")
+        self.assertIn("3/5  NEW open wounds today?", self.api.texts()[-1])
         self.assertEqual(bot.handle_callback(cq("wounds_new", "yes"), OWNER, t), "cb_wounds_new")
         self.assertEqual(bot.handle_callback(cq("wounds_count", "1"), OWNER, t), "cb_wounds_count")
         self.assertEqual(self.api.buttons()[:2], ["☐ Face/mouth", "☐ Scalp"])
@@ -94,26 +98,26 @@ class Checkin(unittest.TestCase):
         self.assertIsNone(bot._session)
         self.assertEqual(json.loads(bot.CHECKIN_STATE_FILE.read_text()), {"evening": None, "sweat": None})
         c = gc.checkin_for_day(DAY)
-        self.assertEqual((c["status"], c["drinks"], c["new_wounds"], c["new_wound_count"], c["new_wound_sites"], c["older_wounds"],
+        self.assertEqual((c["status"], c["drinks"], c["gluten"], c["new_wounds"], c["new_wound_count"], c["new_wound_sites"], c["older_wounds"],
                           c["exercise"], c["exercise_types"], c["exercise_minutes"], c["trigger"], c["source"]),
-                         ("done", "2", "yes", "1", ["Scalp"], "healing", "yes", ["Walking outside"], "30-60", "scheduled", "telegram"))
+                         ("done", "2", "yes", "yes", "1", ["Scalp"], "healing", "yes", ["Walking outside"], "30-60", "scheduled", "telegram"))
         self.assertEqual((c["started_at"], c["finished_at"]), ("2026-10-25T23:15:00", "2026-10-25T23:19:00"))
         self.assertEqual(gc.alcohol_for_night(DAY), 2.0)                             # check-in total replaced the /drinks 1
-        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min · night sweat ?")
+        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25: drinks 2 · gluten yes · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min · night sweat ?")
         self.assertTrue(self.api.texts()[-1].startswith("Saved. Check-in Sun 10/25"))
 
     def test_shortest_path_and_four_plus(self):
         bot.start_checkin(42, T2315)
-        for step, v in (("drinks", "0"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
+        for step, v in (("drinks", "0"), ("gluten", "no"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
             bot.handle_callback(cq(step, v), OWNER, T2315)
         c = gc.checkin_for_day(DAY)
         self.assertEqual((c["status"], c["drinks"], c["new_wounds"], c["exercise"], c["new_wound_sites"]), ("done", "0", "no", "no", []))
         self.assertEqual(gc.alcohol_for_night(DAY), 0.0)                              # an explicit "None" is a real 0
-        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25: drinks none · no new wounds · older: none open · no exercise · night sweat ?")
+        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25: drinks none · gluten no · no new wounds · older: none open · no exercise · night sweat ?")
         bot.start_checkin(42, T2315)                                                 # redo: last row wins
-        for step, v in (("drinks", "4+"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
+        for step, v in (("drinks", "4+"), ("gluten", "unsure"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
             bot.handle_callback(cq(step, v), OWNER, T2315)
-        self.assertEqual(gc.checkin_for_day(DAY)["drinks"], "4+")
+        self.assertEqual((gc.checkin_for_day(DAY)["drinks"], gc.checkin_for_day(DAY)["gluten"]), ("4+", "unsure"))
         self.assertEqual(gc.alcohol_for_night(DAY), 4.0)
         self.assertEqual(len(gc.CHECKIN_CSV.read_text(encoding="utf-8").splitlines()), 3)   # header + 2 rows, append-only
 
@@ -128,9 +132,9 @@ class Checkin(unittest.TestCase):
         self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 26, 0, 49)), "waiting")
         self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 26, 0, 50)), "skipped")      # +90
         c = gc.checkin_for_day(DAY)
-        self.assertEqual((c["status"], c["drinks"], c["new_wounds"], c["exercise"]), ("skipped", "2", "", ""))
+        self.assertEqual((c["status"], c["drinks"], c["gluten"], c["new_wounds"], c["exercise"]), ("skipped", "2", "", "", ""))
         self.assertEqual(gc.alcohol_for_night(DAY), 2.0)                             # the answered part still counts
-        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25 (skipped): drinks 2 · new wounds ? · exercise ? · night sweat ?")
+        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25 (skipped): drinks 2 · gluten ? · new wounds ? · exercise ? · night sweat ?")
         self.assertIsNone(bot._session)
         self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 26, 1, 0)), "idle")          # a skipped row blocks a restart
 
@@ -140,7 +144,7 @@ class Checkin(unittest.TestCase):
         self.assertEqual(bot.checkin_tick(OWNER, T2315), "started")
         self.assertEqual(bot._session["day"], str(DAY))
         self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 25, 23, 16)), "waiting")
-        for step, v in (("drinks", "1"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
+        for step, v in (("drinks", "1"), ("gluten", "no"), ("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
             bot.handle_callback(cq(step, v), OWNER, T2315)
         self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 25, 23, 40)), "idle")        # done: no second start
         # bot was down at 23:15 the next evening: made up at 02:00, not at 06:00
@@ -181,7 +185,7 @@ class Checkin(unittest.TestCase):
         bot.handle_callback(cq("drinks", "3"), OWNER, T2315)
         bot._session = None
         bot._load_session()
-        self.assertEqual((bot._session["step"], bot._session["answers"]["drinks"]), ("wounds_new", "3"))
+        self.assertEqual((bot._session["step"], bot._session["answers"]["drinks"]), ("gluten", "3"))
 
     # ---- backfill CLI + morning card
     def test_backfill_cli_and_card_line(self):
@@ -193,15 +197,17 @@ class Checkin(unittest.TestCase):
         self.assertEqual((c["drinks"], c["new_wounds"], c["new_wound_count"], c["new_wound_sites"], c["older_wounds"], c["exercise"], c["source"]),
                          ("", "yes", "unknown", ["Scalp"], "", "no", "backfill"))
         self.assertIsNone(gc.alcohol_for_night(date(2026, 10, 24)))                   # drinks unknown stays unknown
-        self.assertEqual(gc.checkin_line(c), "Check-in Sat 10/24: drinks ? · new wounds ? (Scalp) · no exercise · night sweat ?")
+        self.assertEqual(gc.checkin_line(c), "Check-in Sat 10/24: drinks ? · gluten ? · new wounds ? (Scalp) · no exercise · night sweat ?")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bot.checkin_log_cli(["2026-10-24", "bogus=1"]), 2)
+            self.assertEqual(bot.checkin_log_cli(["2026-10-24", "gluten=unsure", "exercise=no"]), 0)
+        self.assertIn("gluten not sure", gc.checkin_line(gc.checkin_for_day(date(2026, 10, 24))))
         self.assertIsNone(gc.checkin_for_day(date(2026, 10, 23)))
         self.assertEqual(gc.checkin_line(None), "Check-in: none")
 
     def test_morning_payload_has_checkin(self):
-        for scenario, expect in (("checkin", "Check-in Sat 10/24: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min"),
-                                 ("checkin-skipped", "Check-in Sat 10/24 (skipped): drinks ? · new wounds ? · exercise ?"),
+        for scenario, expect in (("checkin", "Check-in Sat 10/24: drinks 2 · gluten no · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min"),
+                                 ("checkin-skipped", "Check-in Sat 10/24 (skipped): drinks ? · gluten ? · new wounds ? · exercise ?"),
                                  ("checkin-none", "Check-in: none")):
             out = io.StringIO()
             sys.argv = ["garmin_capacity.py", "--mock", scenario, "--date", "2026-10-25"]
@@ -211,6 +217,8 @@ class Checkin(unittest.TestCase):
             self.assertIn(expect, text, scenario)
             payload = json.loads(text.split("<<<CAPACITY_JSON")[1].split("CAPACITY_JSON>>>")[0])
             self.assertIn("checkin", payload)
+            if scenario == "checkin":
+                self.assertEqual(payload["checkin"]["gluten"], "no")
             self.assertEqual(payload["tier"], "YELLOW")                                # display only
 
 

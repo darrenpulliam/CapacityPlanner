@@ -63,9 +63,9 @@ class Consolidation(unittest.TestCase):
                 f.unlink()
         os.environ.pop("MORNING_TIME", None)
 
-    def _evening(self, drinks="2", when=datetime(2026, 10, 25, 23, 15)):
+    def _evening(self, drinks="2", when=datetime(2026, 10, 25, 23, 15), gluten="no"):
         bot.start_checkin(42, when)
-        for step, v in (("drinks", drinks), ("wounds_new", "yes"), ("wounds_count", "2")):
+        for step, v in (("drinks", drinks), ("gluten", gluten), ("wounds_new", "yes"), ("wounds_count", "2")):
             bot.handle_callback(cq(step, v), OWNER, when)
         bot.handle_callback(cq("wounds_sites", "1"), OWNER, when)
         for step, v in (("wounds_sites", "done"), ("wounds_older", "none"), ("exercise", "no")):
@@ -127,12 +127,12 @@ class Consolidation(unittest.TestCase):
         self.assertIn("night sweat: none", gc.checkin_line(c))
 
     def test_old_csv_header_is_migrated_without_losing_rows(self):
-        old = [c for c in gc.CHECKIN_FIELDS if c != "night_sweat"]
+        old = [c for c in gc.CHECKIN_FIELDS if c not in ("night_sweat", "gluten")]
         gc.CHECKIN_CSV.write_text(",".join(old) + "\n2026-10-24,done,4,yes,unknown,Scalp,,no,,,,2026-10-26T00:25:47,manual,backfill\n", encoding="utf-8")
         self.assertEqual(gc.checkin_for_day(date(2026, 10, 24))["drinks"], "4")
         bot.start_sweat(42, datetime(2026, 10, 25, 8, 35))
         bot.handle_callback(cq("sweat", "damp"), OWNER, datetime(2026, 10, 25, 8, 36))
-        self.assertTrue(gc.CHECKIN_CSV.read_text(encoding="utf-8").splitlines()[0].endswith("night_sweat"))
+        self.assertTrue(gc.CHECKIN_CSV.read_text(encoding="utf-8").splitlines()[0].endswith("night_sweat,gluten"))
         c = gc.checkin_for_day(date(2026, 10, 24))
         self.assertEqual((c["drinks"], c["night_sweat"], c["source"]), ("4", "damp", "backfill"))
 
@@ -251,7 +251,7 @@ class Consolidation(unittest.TestCase):
         self.assertEqual(gc.checkin_for_day(date(2026, 10, 24))["night_sweat"], "skipped")
         self.assertEqual(gc.last_drink_time(EVE), "2026-10-25T21:10:00")
         self.assertFalse(src.exists())
-        self.assertTrue((Path(_TMP) / "archive" / "checkins.jsonl").exists())
+        self.assertTrue((bot.DATA_DIR / "archive" / "checkins.jsonl").exists())        # DATA_DIR binds at first gc import
         self.assertEqual(bot.import_checkins_jsonl(src), {"sweat": 0, "drinks": 0, "skipped": 0})   # nothing left to import
 
     def test_import_keeps_an_existing_sweat_answer(self):
@@ -260,6 +260,65 @@ class Consolidation(unittest.TestCase):
         src.write_text(json.dumps({"type": "morning", "ts": "2026-10-26T08:36:00", "day": "2026-10-25", "skipped": False, "sweat": "damp"}), encoding="utf-8")
         self.assertEqual(bot.import_checkins_jsonl(src, archive=False)["sweat"], 0)
         self.assertEqual(gc.checkin_for_day(EVE)["night_sweat"], "soaked")
+
+    # ---- gluten step (2026-10-27)
+    def test_gluten_step_follows_drinks_then_wounds(self):
+        bot.start_checkin(42, datetime(2026, 10, 25, 23, 15))
+        bot.handle_callback(cq("drinks", "1"), OWNER, datetime(2026, 10, 25, 23, 16))
+        self.assertEqual(bot._session["step"], "gluten")
+        self.assertIn("Any gluten today?", self.api.texts()[-1])
+        self.assertEqual(self.api.buttons(), ["No", "Yes", "Not sure"])
+        kb = [p for m, p in self.api.calls if m == "sendMessage" and "reply_markup" in p][-1]["reply_markup"]["inline_keyboard"]
+        self.assertEqual([b["callback_data"] for row in kb for b in row], ["ci|gluten|no", "ci|gluten|yes", "ci|gluten|unsure"])
+        self.assertEqual(bot.handle_callback(cq("wounds_new", "no"), OWNER, datetime(2026, 10, 25, 23, 16)), "cb_stale")
+        self.assertEqual(bot.handle_callback(cq("gluten", "unsure"), OWNER, datetime(2026, 10, 25, 23, 17)), "cb_gluten")
+        self.assertIn("✓ Not sure", [p.get("text", "") for m, p in self.api.calls if m == "editMessageText"][-1])
+        self.assertEqual(bot._session["step"], "wounds_new")
+        for step, v in (("wounds_new", "no"), ("wounds_older", "none"), ("exercise", "no")):
+            bot.handle_callback(cq(step, v), OWNER, datetime(2026, 10, 25, 23, 18))
+        c = gc.checkin_for_day(EVE)
+        self.assertEqual((c["status"], c["gluten"]), ("done", "unsure"))
+        self.assertIn("drinks 1 · gluten not sure · no new wounds", gc.checkin_line(c))
+
+    def test_gluten_before_1400_is_previous_day(self):
+        self._evening(gluten="yes", when=datetime(2026, 10, 26, 0, 30))             # 00:30 belongs to the 10/25 evening
+        self.assertEqual(gc.checkin_for_day(EVE)["gluten"], "yes")
+        self.assertIsNone(gc.checkin_for_day(date(2026, 10, 26)))
+
+    def test_partial_checkin_keeps_gluten_and_skip_leaves_it_blank(self):
+        bot.start_checkin(42, datetime(2026, 10, 25, 23, 15), trigger="scheduled")
+        bot.handle_callback(cq("drinks", "2"), OWNER, datetime(2026, 10, 25, 23, 16))
+        bot.handle_callback(cq("gluten", "yes"), OWNER, datetime(2026, 10, 25, 23, 16))
+        bot.checkin_tick(OWNER, datetime(2026, 10, 26, 0, 1))                          # nudge
+        self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 26, 0, 46)), "skipped")
+        c = gc.checkin_for_day(EVE)
+        self.assertEqual((c["status"], c["drinks"], c["gluten"], c["new_wounds"]), ("skipped", "2", "yes", ""))
+        self.assertEqual(gc.checkin_line(c), "Check-in Sun 10/25 (skipped): drinks 2 · gluten yes · new wounds ? · exercise ? · night sweat ?")
+        # a check-in skipped before the gluten answer leaves it blank
+        bot.start_checkin(42, datetime(2026, 10, 26, 23, 15), trigger="scheduled")
+        bot.checkin_tick(OWNER, datetime(2026, 10, 27, 0, 0))
+        self.assertEqual(bot.checkin_tick(OWNER, datetime(2026, 10, 27, 0, 45)), "skipped")
+        c = gc.checkin_for_day(date(2026, 10, 26))
+        self.assertEqual((c["status"], c["drinks"], c["gluten"]), ("skipped", "", ""))
+        self.assertIn("drinks ? · gluten ? · new wounds ?", gc.checkin_line(c))
+
+    def test_night_sweat_header_migrates_to_gluten_without_losing_rows(self):
+        pre = [c for c in gc.CHECKIN_FIELDS if c != "gluten"]                         # the live 10/26 header
+        gc.CHECKIN_CSV.write_text(",".join(pre) + "\n"
+                                  "2026-10-24,done,4,yes,unknown,Scalp,,no,,,,2026-10-26T00:25:47,manual,backfill,\n"
+                                  "2026-10-24,,,,,,,,,,,2026-10-25T08:36:00,sweat,import,damp\n", encoding="utf-8")
+        self._evening(gluten="no")
+        lines = gc.CHECKIN_CSV.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], ",".join(gc.CHECKIN_FIELDS))
+        self.assertTrue(lines[0].endswith("night_sweat,gluten"))
+        self.assertEqual(len(lines), 4)                                                 # header + 2 old rows + tonight
+        old = gc.checkin_for_day(date(2026, 10, 24))
+        self.assertEqual((old["drinks"], old["source"], old["night_sweat"], old["gluten"]), ("4", "backfill", "damp", ""))
+        self.assertIn("drinks 4 · gluten ? · new wounds ?", gc.checkin_line(old))
+        self.assertEqual(gc.checkin_for_day(EVE)["gluten"], "no")
+        bot.start_sweat(42, T0835)                                                      # a morning sweat row never blanks gluten
+        bot.handle_callback(cq("sweat", "none"), OWNER, T0835)
+        self.assertEqual((gc.checkin_for_day(EVE)["gluten"], gc.checkin_for_day(EVE)["night_sweat"]), ("no", "none"))
 
     # ---- the morning card
     def test_card_line_and_payload_have_one_checkin_key(self):
@@ -273,8 +332,8 @@ class Consolidation(unittest.TestCase):
         sys.argv = ["garmin_capacity.py", "--mock", "checkin-none", "--date", "2026-10-26"]   # mock checkin is forced; use the real reader below
         c = gc.checkin_for_day(EVE)
         line = gc.checkin_line(c)
-        self.assertEqual(line, "Check-in Sun 10/25: drinks 2 (last 10:40 PM) · new wounds 2 (Scalp) · older: none open · no exercise · night sweat: damp")
-        self.assertEqual(c["night_sweat"], "damp")
+        self.assertEqual(line, "Check-in Sun 10/25: drinks 2 (last 10:40 PM) · gluten no · new wounds 2 (Scalp) · older: none open · no exercise · night sweat: damp")
+        self.assertEqual((c["night_sweat"], c["gluten"]), ("damp", "no"))
         self.assertEqual(c["last_drink_time"], "2026-10-25T22:40:00")
         with contextlib.redirect_stdout(out):
             gc.main()

@@ -19,8 +19,9 @@ Commands (owner chat only; TELEGRAM_CHAT_ID in this folder's .env, never anyone 
 Anything else gets a one-line hint. The commands are registered with setMyCommands at start.
 
 Nightly check-in (2026-10-25, display only): at CHECKIN_TIME (default 23:15, .env CHECKIN_TIME=HH:MM) the bot
-asks four inline-button questions: drinks today (None/1/2/3/4+; shows what /drinks already logged; the answer
-sets the day's total and is written to data\\alcohol.csv with source "checkin"), NEW open wounds (No/Yes ->
+asks five inline-button questions: drinks today (None/1/2/3/4+; shows what /drinks already logged; the answer
+sets the day's total and is written to data\\alcohol.csv with source "checkin"), any gluten today (No/Yes/Not sure
+-> no|yes|unsure, 2026-10-27), NEW open wounds (No/Yes ->
 1/2/3+ -> sites multi-select -> Done), older wounds (None open/Healing/Getting worse), exercise (No/Yes -> types
 multi-select -> Done -> <15/15-30/30-60/60+). One nudge CHECKIN_NUDGE_MIN after the last prompt; still silent
 CHECKIN_SKIP_MIN after it -> the row is logged as "skipped" with the answers given so far. The day follows the
@@ -71,7 +72,7 @@ COMMANDS = [
     {"command": "capacity", "description": "Current Body Battery, stress, HR (live Garmin pull)"},
     {"command": "today", "description": "This morning's capacity card"},
     {"command": "drinks", "description": "Log alcohol: /drinks N [M/D] (0-10; before 2 PM = last night)"},
-    {"command": "checkin", "description": "Nightly check-in now: drinks, new/older wounds, exercise (buttons)"},
+    {"command": "checkin", "description": "Nightly check-in now: drinks, gluten, new/older wounds, exercise (buttons)"},
     {"command": "sweat", "description": "Night-sweat question for last night (buttons)"},
     {"command": "drink", "description": "Log a drink now (or just text: beer, 2 wine, bourbon)"},
     {"command": "undo", "description": "Remove the last drink you texted"},
@@ -334,14 +335,16 @@ SWEAT_LABEL = {"none": "No sweating", "damp": "Damp (clothes/pillow)", "soaked":
 WOUND_SITES = ["Face/mouth", "Scalp", "Hands/arms", "Legs/feet", "Torso/back", "Other"]
 EXERCISE_TYPES = ["Strength training", "Treadmill", "Walking outside", "Elliptical", "Biking", "Hiking"]
 EXERCISE_MINUTES = ["<15", "15-30", "30-60", "60+"]
-CHECKIN_NEXT = {"drinks": "wounds_new", "wounds_new": {"no": "wounds_older", "yes": "wounds_count"},
+CHECKIN_NEXT = {"drinks": "gluten", "gluten": "wounds_new", "wounds_new": {"no": "wounds_older", "yes": "wounds_count"},
                 "wounds_count": "wounds_sites", "wounds_sites": "wounds_older", "wounds_older": "exercise",
                 "exercise": {"no": "done", "yes": "exercise_types"}, "exercise_types": "exercise_minutes",
                 "exercise_minutes": "done"}
 CHECKIN_MULTI = {"wounds_sites": ("new_wound_sites", WOUND_SITES), "exercise_types": ("exercise_types", EXERCISE_TYPES)}
-CHECKIN_FIELD = {"drinks": "drinks", "wounds_new": "new_wounds", "wounds_count": "new_wound_count",
+CHECKIN_FIELD = {"drinks": "drinks", "gluten": "gluten", "wounds_new": "new_wounds", "wounds_count": "new_wound_count",
                  "wounds_older": "older_wounds", "exercise": "exercise", "exercise_minutes": "exercise_minutes"}
-CHECKIN_LABEL = {"0": "None", "no": "No", "yes": "Yes", "none": "None open", "healing": "Healing", "worse": "Getting worse"}
+CHECKIN_LABEL = {"0": "None", "no": "No", "yes": "Yes", "none": "None open", "healing": "Healing", "worse": "Getting worse",
+                 "unsure": "Not sure"}
+CHECKIN_CLI_FIELDS = gc.CHECKIN_FIELDS[2:10] + ["gluten"]   # --checkin-log answer fields
 
 _session: Optional[Dict[str, Any]] = None   # the one in-flight evening check-in (owner chat only)
 _sweat: Optional[Dict[str, Any]] = None     # the one in-flight morning night-sweat question
@@ -374,19 +377,21 @@ def checkin_question(s: Dict[str, Any]):
     if step == "drinks":
         prior = gc.alcohol_for_night(d)
         note = f"(/drinks logged {prior:g} so far)" if prior is not None else "(nothing logged via /drinks yet)"
-        return (f"Check-in {_day_label(d)} — 1/4  Drinks today? {note}",
+        return (f"Check-in {_day_label(d)} — 1/5  Drinks today? {note}",
                 [[("None", "ci|drinks|0"), ("1", "ci|drinks|1"), ("2", "ci|drinks|2"), ("3", "ci|drinks|3"), ("4+", "ci|drinks|4+")]])
+    if step == "gluten":
+        return "2/5  Any gluten today?", [[("No", "ci|gluten|no"), ("Yes", "ci|gluten|yes"), ("Not sure", "ci|gluten|unsure")]]
     if step == "wounds_new":
-        return "2/4  NEW open wounds today?", [[("No", "ci|wounds_new|no"), ("Yes", "ci|wounds_new|yes")]]
+        return "3/5  NEW open wounds today?", [[("No", "ci|wounds_new|no"), ("Yes", "ci|wounds_new|yes")]]
     if step == "wounds_count":
         return "How many new wounds?", [[("1", "ci|wounds_count|1"), ("2", "ci|wounds_count|2"), ("3+", "ci|wounds_count|3+")]]
     if step == "wounds_sites":
         return "Where? Tap all that apply, then Done.", _multi_rows("wounds_sites", WOUND_SITES, a.get("new_wound_sites") or [])
     if step == "wounds_older":
-        return "3/4  Older wounds?", [[("None open", "ci|wounds_older|none"), ("Healing", "ci|wounds_older|healing"),
+        return "4/5  Older wounds?", [[("None open", "ci|wounds_older|none"), ("Healing", "ci|wounds_older|healing"),
                                       ("Getting worse", "ci|wounds_older|worse")]]
     if step == "exercise":
-        return "4/4  Exercise today?", [[("No", "ci|exercise|no"), ("Yes", "ci|exercise|yes")]]
+        return "5/5  Exercise today?", [[("No", "ci|exercise|no"), ("Yes", "ci|exercise|yes")]]
     if step == "exercise_types":
         return "What kind? Tap all that apply, then Done.", _multi_rows("exercise_types", EXERCISE_TYPES, a.get("exercise_types") or [])
     if step == "exercise_minutes":
@@ -802,13 +807,13 @@ def checkin_log_cli(args: List[str]) -> int:
     try:
         day = date.fromisoformat(args[0])
     except Exception:
-        print("usage: --checkin-log YYYY-MM-DD field=value ...  fields:", ", ".join(gc.CHECKIN_FIELDS[2:10]))
+        print("usage: --checkin-log YYYY-MM-DD field=value ...  fields:", ", ".join(CHECKIN_CLI_FIELDS))
         return 2
     answers: Dict[str, Any] = {}
     for kv in args[1:]:
         k, _, v = kv.partition("=")
-        if k not in gc.CHECKIN_FIELDS[2:10]:
-            print(f"unknown field {k!r}; allowed: {', '.join(gc.CHECKIN_FIELDS[2:10])}")
+        if k not in CHECKIN_CLI_FIELDS:
+            print(f"unknown field {k!r}; allowed: {', '.join(CHECKIN_CLI_FIELDS)}")
             return 2
         answers[k] = v.split(";") if k in gc.CHECKIN_LIST_FIELDS else v
     row = gc.checkin_row(day, answers, status="done", trigger="manual", source="backfill")

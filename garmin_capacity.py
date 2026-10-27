@@ -111,12 +111,13 @@ Overnight fluid loss (2026-10-25, display only): Garmin Index scale weigh-ins vi
   overnight.fetched_at and the Overnight line ends with "· as of 12:15". --dry-run on the update pass prints
   only (no save, no send), so it never masks the real 12:15 change detection.
 Nightly check-in (2026-10-25, display only; capacity_bot.py asks it with inline buttons at CHECKIN_TIME, default
-  23:15, or on /checkin): drinks today, NEW open wounds (count + sites), older wounds, exercise (types + minutes).
+  23:15, or on /checkin): drinks today, gluten (no|yes|unsure, 2026-10-27), NEW open wounds (count + sites),
+  older wounds, exercise (types + minutes).
   One row per check-in appended to data\\checkin.csv (CHECKIN_FIELDS; the last row for a day wins; status done |
   skipped). The day follows the /drinks rule (before 14:00 = yesterday), and the drinks answer is ALSO written to
   data\\alcohol.csv (source "checkin"), so metrics.alcohol_drinks and the check-in agree. The morning run puts
   the previous evening's row in payload.checkin (lists for sites / types; null when none) and one card line
-  "Check-in Sat 10/25: drinks 2 · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
+  "Check-in Sat 10/25: drinks 2 · gluten no · new wounds 1 (Scalp) · older: healing · exercise Walking outside 30-60 min".
   2026-10-26 consolidation (checkin_bot retired): data\\checkin.csv gains night_sweat (none|damp|soaked|skipped; the
   08:35 morning question, stored as its own row with trigger "sweat" and MERGED by checkin_for_day, never replacing
   the evening answers); free-text drinks go to data\\drink_events.csv (+ the night total in alcohol.csv) and
@@ -175,7 +176,8 @@ BB_GAP_MAX_MIN = 20                          # timeline gaps longer than this ar
 DRINK_EVENTS_CSV = DATA_DIR / "drink_events.csv"   # ts,night_date,count,what — free-text drinks; count < 0 = /undo of the last one
 CHECKIN_FIELDS = ["day", "status", "drinks", "new_wounds", "new_wound_count", "new_wound_sites", "older_wounds",
                   "exercise", "exercise_types", "exercise_minutes", "started_at", "finished_at", "trigger", "source",
-                  "night_sweat"]                                   # night_sweat: none|damp|soaked|skipped, set by the next morning's row
+                  "night_sweat",                                   # night_sweat: none|damp|soaked|skipped, set by the next morning's row
+                  "gluten"]                                        # gluten: no|yes|unsure (2026-10-27); "" = skipped / older row
 CHECKIN_LIST_FIELDS = ("new_wound_sites", "exercise_types")   # stored ";"-joined, read back as lists
 TOKEN_DIR = Path(os.getenv("GARMINTOKENS", str(Path.home() / ".garminconnect")))
 CACHE_MAX_AGE_H = 20           # reuse data\raw\<date>.json if fetched less than this many hours ago
@@ -531,7 +533,7 @@ MOCK_CASES = {
     "overnight-none":    {"overnight": {}},                                                                   # scale unused: overnight null
     "overnight-late-am": {"overnight": {"pm": 245.2, "am": 242.8, "am_at": "09:40"}},                       # AM weigh-in after the 09:00 run (10.1 h); the 12:15 pass picks it up
     # nightly check-in (display only): payload.checkin + one card line; tier / bedtime unchanged
-    "checkin":          {"checkin": {"status": "done", "drinks": "2", "new_wounds": "yes", "new_wound_count": "1",
+    "checkin":          {"checkin": {"status": "done", "drinks": "2", "gluten": "no", "new_wounds": "yes", "new_wound_count": "1",
                                      "new_wound_sites": ["Scalp"], "older_wounds": "healing", "exercise": "yes",
                                      "exercise_types": ["Walking outside"], "exercise_minutes": "30-60"}, "alcohol": 2},
     "checkin-skipped":  {"checkin": {"status": "skipped", "drinks": "", "new_wounds": "", "older_wounds": "", "exercise": ""}},
@@ -1239,6 +1241,8 @@ def checkin_line(c: Optional[Dict[str, Any]]) -> str:
     except Exception:
         pass
     parts.append(dpart)
+    gl = {"no": "no", "yes": "yes", "unsure": "not sure"}.get((c.get("gluten") or "").lower())
+    parts.append(f"gluten {gl}" if gl else "gluten ?")
     nw = (c.get("new_wounds") or "").lower()
     if nw == "yes":
         n = (c.get("new_wound_count") or "").strip()
