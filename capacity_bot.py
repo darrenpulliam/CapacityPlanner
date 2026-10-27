@@ -68,6 +68,9 @@ STATE_FILE = DATA_DIR / "capacity_bot_state.json"
 POLL_TIMEOUT_S = 30
 STALE_S = 600                 # a command older than this when first seen is skipped (bot was down)
 NOW_TIMEOUT_S = 240
+LOCK_STALE_S = 120           # a live lock holder whose last sign of life (heartbeat / lock write) is older -> taken over
+LOCK_WAIT_S = 15             # a live, fresh holder gets this long to exit (Stop-ScheduledTask returns before it is gone)
+HEARTBEAT_EVERY_S = 30       # backoff sleeps still beat this often, so a waiting bot never looks stale
 COMMANDS = [
     {"command": "capacity", "description": "Current Body Battery, stress, HR (live Garmin pull)"},
     {"command": "today", "description": "This morning's capacity card"},
@@ -164,10 +167,32 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def acquire_lock() -> bool:
-    """True if this process now holds the lock. A lock held by a live PID -> False."""
+def _holder_last_seen(holder: int) -> float:
+    """Epoch of the lock holder's last sign of life: the lock file's mtime (a just-started holder has no heartbeat
+    yet) or its own heartbeat line (a heartbeat written by another PID does not count). 0 when neither exists."""
+    seen = 0.0
+    try:
+        seen = LOCK_FILE.stat().st_mtime
+    except OSError:
+        pass
+    try:
+        lines = HEARTBEAT_FILE.read_text(encoding="utf-8").splitlines()
+        m = re.search(r"\bpid=(\d+)", lines[2]) if len(lines) >= 3 else None
+        if m and int(m.group(1)) == holder:
+            seen = max(seen, float(lines[0]))
+    except Exception:
+        pass
+    return seen
+
+
+def acquire_lock(wait_s: float = LOCK_WAIT_S) -> bool:
+    """True if this process now holds the lock. Taken over when the holder PID is dead, or alive but silent for more
+    than LOCK_STALE_S (hung, or a reused PID). A live holder with a fresh heartbeat gets wait_s to exit (a restart's
+    Start can fire while the stopped bot is still exiting, 2026-10-27); still there -> False (this copy exits)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
+    deadline = time.time() + wait_s
+    waited = False
+    for _ in range(4 * int(wait_s + 1) + 3):
         try:
             fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode())
@@ -179,13 +204,27 @@ def acquire_lock() -> bool:
             except Exception:
                 holder = 0
             if holder != os.getpid() and _pid_alive(holder):
-                log.info("another capacity_bot holds the lock (PID %s); exiting", holder)
-                return False
-            log.warning("stale lock (PID %s not running); taking it over", holder)
+                age = time.time() - _holder_last_seen(holder)
+                if age <= LOCK_STALE_S:
+                    if time.time() < deadline:
+                        if not waited:
+                            log.info("lock held by live PID %s; waiting up to %ss for it to exit", holder, wait_s)
+                            waited = True
+                        time.sleep(0.5)
+                        continue
+                    log.info("another capacity_bot holds the lock (PID %s, last seen %.0fs ago); exiting", holder, age)
+                    return False
+                log.warning("lock holder PID %s is alive but silent for %.0fs (> %ss); taking the lock over",
+                            holder, age, LOCK_STALE_S)
+            else:
+                log.warning("stale lock (PID %s not running); taking it over", holder)
             try:
                 LOCK_FILE.unlink()
             except FileNotFoundError:
                 pass
+            except Exception as e:
+                log.error("cannot remove the stale lock (%s); exiting", e)
+                return False
     return False
 
 
@@ -205,6 +244,14 @@ def write_heartbeat(last_update_id: Optional[int], last_cmd: str) -> None:
         os.replace(tmp, HEARTBEAT_FILE)
     except Exception as e:
         log.warning("heartbeat write failed: %s", e)
+
+
+def _sleep_beating(seconds: float, last_update_id: Optional[int], last_cmd: str) -> None:
+    """time.sleep that keeps the heartbeat fresh (a 300 s backoff must not make the bot look stale to acquire_lock)."""
+    end = time.time() + seconds
+    while (left := end - time.time()) > 0:
+        time.sleep(min(HEARTBEAT_EVERY_S, left))
+        write_heartbeat(last_update_id, last_cmd)
 
 
 def load_offset() -> Optional[int]:
@@ -944,11 +991,12 @@ def main() -> int:
             except Exception as e:
                 log.warning("startup call failed: %s: %s; retry in %ss", type(e).__name__, e, backoff)
             write_heartbeat(None, "starting")
-            time.sleep(backoff)
+            _sleep_beating(backoff, None, "starting")
             backoff = min(backoff * 2, 300)
         log.info("started as @%s (pid %s), owner chat set, %d commands registered, check-in at %s",
                  me.get("username"), os.getpid(), len(COMMANDS), CHECKIN_TIME)
         offset = load_offset()
+        write_heartbeat(offset, "started")
         _load_session()
         backoff = 5
         while True:
@@ -958,18 +1006,18 @@ def main() -> int:
             except TelegramError as e:
                 if e.status == 409:
                     log.error("409 Conflict: another poller is using this token; retrying in 30s")
-                    time.sleep(30)
+                    _sleep_beating(30, offset, "409")
                 elif e.status in (401, 404):
                     log.error("token rejected (%s); exiting so the task retries", e)
                     return 3
                 else:
                     log.warning("Telegram error %s; retry in %ss", e, backoff)
-                    time.sleep(backoff)
+                    _sleep_beating(backoff, offset, f"error {e.status}")
                     backoff = min(backoff * 2, 300)
             except Exception as e:
                 log.warning("poll failed: %s: %s; retry in %ss", type(e).__name__, e, backoff)
                 write_heartbeat(offset, f"error {type(e).__name__}")
-                time.sleep(backoff)
+                _sleep_beating(backoff, offset, f"error {type(e).__name__}")
                 backoff = min(backoff * 2, 300)
             if a.once:
                 return 0
