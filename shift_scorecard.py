@@ -45,7 +45,9 @@ SHIFT_TITLE_RE = re.compile(r"^\s*Shift in\b", re.I)
 EARLY_BEFORE_H = 8          # OPEN_EARLY: start before 08:00
 OPEN_BEFORE_H = 9           # OPEN_8_9: start 08:00-08:59; the BB RISK flag also uses 9:00
 LATE_AFTER_H = 21           # CLOSE_LATE / BB RISK: end after 21:00
-CLOPEN_GAP_H = 11           # next shift starts less than this long after the previous one ended
+CLOPEN_GAP_H = 12           # NEAR-CLOPEN: next shift starts less than this long after the previous one ended
+CLOPEN_CLOSE_H = 21         # CLOPEN: previous shift ends at/after this hour ...
+CLOPEN_OPEN_H = 9           # ... and the next-day shift starts at/before this hour
 MIN_N = 5                   # fewer shifts than this in a type: "too few to conclude"
 DEFAULT_DRIVE_MIN = 60
 DRIVE_MIN = {               # Bardstown home -> store city, minutes
@@ -116,18 +118,28 @@ def save_shifts(rows: List[Dict[str, str]]) -> None:
 
 
 def import_shifts(new: List[Dict[str, str]]) -> Dict[str, int]:
-    """Merge by start time (latest import wins). Returns counts."""
-    have = {r["start"]: r for r in load_shifts()}
+    """Merge by (start, location); a blank incoming location matches any row with that start. Non-blank incoming
+    values win, blank ones never overwrite what is already stored. Returns counts."""
+    rows = load_shifts()
     added = changed = 0
     for r in new:
-        old = have.get(r["start"])
+        loc = (r.get("location") or "").strip()
+        old = next((o for o in rows if o["start"] == r["start"]
+                    and (not loc or (o.get("location") or "").strip() == loc)), None)
         if old is None:
+            rows.append({k: r.get(k, "") or "" for k in SHIFT_FIELDS})
             added += 1
-        elif any(old.get(k) != r.get(k) for k in ("end", "location")):
-            changed += 1
-        have[r["start"]] = r
-    save_shifts(list(have.values()))
-    return {"added": added, "changed": changed, "total": len(have)}
+            continue
+        diff = False
+        for k in SHIFT_FIELDS:
+            v = r.get(k)
+            if v not in (None, "") and old.get(k) != v:
+                if k in ("end", "location"):
+                    diff = True
+                old[k] = v
+        changed += diff
+    save_shifts(rows)
+    return {"added": added, "changed": changed, "total": len(rows)}
 
 
 def parse_ics(text: str) -> List[Dict[str, Any]]:
@@ -174,7 +186,71 @@ def fetch_ics() -> List[Dict[str, Any]]:
         raise RuntimeError("SHIFT_ICS_URL is not set in .env (Google Calendar > Settings > Integrate calendar > "
                            "Secret address in iCal format)")
     with urllib.request.urlopen(url, timeout=30, context=gc._TLS_CTX) as r:
-        return parse_ics(r.read().decode("utf-8", "replace"))
+        text = r.read().decode("utf-8", "replace")
+    if "BEGIN:VCALENDAR" not in text:
+        raise ValueError("response is not an iCal feed (wrong or revoked address?)")
+    return parse_ics(text)
+
+
+# ───────────────────────────── daily ICS auto-import (called from the bot's poll loop) ─────────────────────────────
+ICS_STATE = DATA_DIR / "ics_state.json"
+ICS_IMPORT_TIME = (3, 30)
+_ics_startup_done = False
+
+
+def _ics_state() -> Dict[str, str]:
+    try:
+        return json.loads(ICS_STATE.read_text(encoding="utf-8"))
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _ics_save(st: Dict[str, str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ICS_STATE.write_text(json.dumps(st, indent=1), encoding="utf-8")
+
+
+def ics_tick(send, owner: str, now: Optional[datetime] = None) -> str:
+    """Import the calendar feed once on bot startup and once a day after 03:30. Silent when SHIFT_ICS_URL is unset.
+    A failure is logged and warned about by Telegram at most once a day; the feed address is never printed."""
+    global _ics_startup_done
+    now = now or datetime.now()
+    try:
+        gc.load_env()
+        url = os.getenv("SHIFT_ICS_URL", "").strip()
+        if not url:
+            return "idle"
+        st = _ics_state()
+        today = now.date().isoformat()
+        at = datetime(now.year, now.month, now.day, *ICS_IMPORT_TIME)
+        startup = not _ics_startup_done
+        if not (startup or (now >= at and st.get("last_daily") != today)):
+            return "idle"
+        _ics_startup_done = True
+        if now >= at:
+            st["last_daily"] = today                         # a startup after 03:30 counts as today's daily run
+        try:
+            res = import_shifts(shifts_from_events(fetch_ics()))
+            st["last_ok"] = now.isoformat(timespec="seconds")
+            _ics_save(st)
+            log.info("ics import ok: %s", res)
+            try:
+                build()
+            except Exception as e:                           # noqa: BLE001
+                log.warning("scorecard rebuild after import failed: %s: %s", type(e).__name__, e)
+            return "ics_import"
+        except Exception as e:                               # noqa: BLE001
+            reason = f"{type(e).__name__}: {str(e).replace(url, '[feed]')[:120]}"
+            log.warning("ics import failed: %s", reason)
+            if st.get("last_warn") != today and send(int(owner), (
+                    f"Shift calendar import failed ({reason}). shifts.csv unchanged; "
+                    f"will retry tomorrow 3:30 AM or when the bot restarts.")):
+                st["last_warn"] = today
+            _ics_save(st)
+            return "ics_error"
+    except Exception as e:                                   # noqa: BLE001
+        log.warning("ics tick failed: %s: %s", type(e).__name__, e)
+        return "error"
 
 
 # ───────────────────────────── classification ─────────────────────────────
@@ -216,7 +292,11 @@ def annotate(shifts: List[Dict[str, str]]) -> List[Dict[str, Any]]:
             a["consecutive_days"] = prev["consecutive_days"]          # a second shift the same day
         else:
             a["consecutive_days"] = 1
-        a["clopen"] = bool(prev is not None and 0 < (s - prev["_e"]).total_seconds() / 3600 < CLOPEN_GAP_H)
+        gap_h = (s - prev["_e"]).total_seconds() / 3600 if prev is not None else None
+        a["clopen"] = bool(prev is not None and gap_h > 0 and (s.date() - prev["_s"].date()).days == 1
+                           and _end_hour(prev["_s"], prev["_e"]) >= CLOPEN_CLOSE_H
+                           and s.hour + s.minute / 60 <= CLOPEN_OPEN_H)
+        a["near_clopen"] = bool(prev is not None and not a["clopen"] and 0 < gap_h < CLOPEN_GAP_H)
         out.append(a)
         prev = a
     return out
@@ -258,7 +338,7 @@ def build_rows(hist: Optional[List[Dict[str, Any]]] = None, today: Optional[date
             "start": a["_s"].strftime("%H:%M"), "end": a["_e"].strftime("%H:%M"),
             "shift_type": a["shift_type"], "bb_risk": "BB RISK" if a["bb_risk"] else "",
             "drive_min": a["drive_min"], "consecutive_days": a["consecutive_days"],
-            "clopen": "CLOPEN" if a["clopen"] else "",
+            "clopen": "CLOPEN" if a["clopen"] else ("NEAR-CLOPEN" if a["near_clopen"] else ""),
             "planned_bed": _hm(r0.get("bedtime_target", "")),
             "sleep_onset": _hm(r1.get("sleep_onset", "")), "wake_time": _hm(r1.get("wake_time", "")),
             "sleep_h": round(smin / 60, 1) if smin else "", "sleep_score": r1.get("sleep_score", "") or "",
@@ -391,10 +471,12 @@ def report_md(rows: List[Dict[str, Any]], today: Optional[date] = None) -> str:
         L.append(f"| {s['type']} | {s['shifts']} | {s['bb']['n']} | {_fmt(s['bb'])} | {_fmt(s['recharge'])} | "
                  f"{_fmt(s['sleep_h'])} | {note} |")
     risk = [r for r in rows if r["bb_risk"]]
-    clo = [r for r in rows if r["clopen"]]
+    clo = [r for r in rows if r["clopen"] == "CLOPEN"]
+    near = [r for r in rows if r["clopen"] == "NEAR-CLOPEN"]
     streak = max([int(r["consecutive_days"]) for r in rows], default=0)
     L += ["", f"Flags in this period: {len(risk)} BB RISK shifts, {len(clo)} clopens "
-          f"(next shift under {CLOPEN_GAP_H} h after the last ended), longest run {streak} days in a row.", "",
+          f"(close at/after 9 PM, open at/before 9 AM next day) and {len(near)} near-clopens "
+          f"(any other gap under {CLOPEN_GAP_H} h), longest run {streak} days in a row.", "",
           "## Last 14 shifts", "",
           "| Date | Where | Hours | Type | Flags | Run | Slept | BB next | BB +2 | Recharge | Drinks | Caffeine mg |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]

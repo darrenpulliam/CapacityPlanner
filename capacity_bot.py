@@ -1054,6 +1054,9 @@ def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
     stick = sweat_tick(owner)
     if stick not in ("idle", "sweat_waiting"):
         last_cmd = stick
+    itick = sc.ics_tick(send, owner)
+    if itick not in ("idle", "error"):
+        last_cmd = itick
     ctick = coach.tick(send, owner)
     if ctick not in ("idle", "error"):
         last_cmd = ctick

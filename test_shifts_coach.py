@@ -465,5 +465,164 @@ class CoachMessages(Base):
         self.assertIn("No shift has a next-day", coach.weekly_message(date(2026, 10, 25)))
 
 
+# ───────────────────────────── clopen / near-clopen (12 h rule) and the daily ICS import ─────────────────────────────
+class ClopenRule(Base):
+    def flags(self, *events):
+        self.shifts(*events)
+        return [(x["clopen"], x["near_clopen"]) for x in sc.annotate(sc.load_shifts())]
+
+    def test_strict_clopen_close_9pm_open_9am(self):
+        self.assertEqual(self.flags(ev("2026-11-03", "13:00", "21:00"), ev("2026-11-04", "09:00", "17:00")),
+                         [(False, False), (True, False)])           # 21:00 -> 09:00 = 12 h: clopen by definition
+
+    def test_close_before_9pm_is_not_clopen_but_near_under_12h(self):
+        self.assertEqual(self.flags(ev("2026-11-03", "12:00", "20:00"), ev("2026-11-04", "07:00", "15:00")),
+                         [(False, False), (False, True)])           # 11 h gap, closed before 9 PM
+
+    def test_open_after_9am_after_late_close_is_near_only_if_gap_under_12h(self):
+        self.assertEqual(self.flags(ev("2026-11-03", "14:00", "22:00"), ev("2026-11-04", "09:30", "17:00")),
+                         [(False, False), (False, True)])           # 11.5 h
+        self.setUp()
+        self.assertEqual(self.flags(ev("2026-11-03", "14:00", "22:00"), ev("2026-11-04", "10:00", "17:00")),
+                         [(False, False), (False, False)])          # exactly 12 h
+
+    def test_close_past_midnight_then_early_open_is_clopen(self):
+        self.assertEqual(self.flags(ev("2026-11-03", "16:00", "23:30"), ev("2026-11-04", "08:00", "16:00")),
+                         [(False, False), (True, False)])
+
+    def test_row_label(self):
+        self.shifts(ev("2026-11-03", "14:00", "22:00"), ev("2026-11-04", "07:00", "15:00"),
+                    ev("2026-11-05", "09:30", "17:00"), ev("2026-11-06", "10:00", "17:00"))
+        self.history([])
+        rows = sc.build_rows(today=date(2026, 11, 20))
+        self.assertEqual([r["clopen"] for r in rows], ["", "CLOPEN", "", ""])
+        self.assertEqual(sc.annotate(sc.load_shifts())[2]["near_clopen"], False)    # 15:00 -> 09:30 next day = 18.5 h
+
+
+class ImportMerge(Base):
+    def test_blank_values_never_overwrite(self):
+        self.shifts(ev("2026-11-05", "07:00", "15:00"))
+        blank = {"summary": "", "location": "", "start": {"dateTime": "2026-11-05T07:00:00-04:00"},
+                 "end": {"dateTime": "2026-11-05T15:00:00-04:00"}}
+        blank["summary"] = "Shift in X"
+        r = sc.import_shifts(sc.shifts_from_events([blank]))
+        rows = sc.load_shifts()
+        self.assertEqual((r["added"], r["total"], len(rows)), (0, 1, 1))
+        self.assertIn("FRANKFORT", rows[0]["location"])
+        self.assertEqual(rows[0]["city"], "FRANKFORT")
+
+    def test_dedupe_by_start_and_location(self):
+        self.shifts(ev("2026-11-05", "07:00", "15:00"))
+        self.shifts(ev("2026-11-05", "07:00", "15:00"))
+        self.assertEqual(len(sc.load_shifts()), 1)
+        self.shifts(ev("2026-11-05", "07:00", "15:00", loc="805 BARDSTOWN RD, SPRINGFIELD, KY 40069"))
+        self.assertEqual(len(sc.load_shifts()), 2)                  # same start, other store: kept separately
+
+
+ICS_OK = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Shift in 09855S\r\nLOCATION:1300 US HIGHWAY 127 S\\, FRANKFORT\\, KY 40601\r\n"
+          "DTSTART;TZID=America/New_York:20261105T070000\r\nDTEND;TZID=America/New_York:20261105T150000\r\n"
+          "END:VEVENT\r\nEND:VCALENDAR\r\n")
+
+
+class IcsTick(Base):
+    URL = "https://calendar.google.com" + "/calendar/" + "ical/x%40y/private-SECRETTOKEN/basic.ics"   # fixture, split so the secret scan stays clean
+
+    def setUp(self):
+        super().setUp()
+        self.extra = [mock.patch.object(sc, "ICS_STATE", self.tmp / "ics_state.json"),
+                      mock.patch.object(sc, "_ics_startup_done", False),
+                      mock.patch.object(gc, "load_env", lambda *a, **k: None),
+                      mock.patch.object(sc, "build", lambda *a, **k: {})]
+        for p in self.extra:
+            p.start()
+        os.environ["SHIFT_ICS_URL"] = self.URL
+        self.out = []
+        self.fetch_calls = 0
+
+    def tearDown(self):
+        os.environ.pop("SHIFT_ICS_URL", None)
+        for p in reversed(self.extra):
+            p.stop()
+        super().tearDown()
+
+    def send(self, chat, text):
+        self.out.append(text)
+        return True
+
+    def fake_fetch(self, text):
+        def f():
+            self.fetch_calls += 1
+            if isinstance(text, Exception):
+                raise text
+            return sc.parse_ics(text)
+        return f
+
+    def test_silent_when_url_unset(self):
+        os.environ.pop("SHIFT_ICS_URL")
+        with mock.patch.object(sc, "fetch_ics", self.fake_fetch(ICS_OK)):
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 31)), "idle")
+        self.assertEqual((self.fetch_calls, self.out), (0, []))
+
+    def test_startup_import_then_once_a_day_after_0330(self):
+        with mock.patch.object(sc, "fetch_ics", self.fake_fetch(ICS_OK)):
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 1, 0)), "ics_import")      # startup
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 1, 5)), "idle")
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 29)), "idle")
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 30)), "ics_import")     # daily slot
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 9, 0)), "idle")
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 2, 3, 31)), "ics_import")     # next day
+        self.assertEqual(self.fetch_calls, 3)
+        self.assertEqual(len(sc.load_shifts()), 1)
+        self.assertEqual(self.out, [])
+
+    def test_error_warns_once_a_day_and_never_prints_the_feed_address(self):
+        boom = RuntimeError("HTTP Error 404 for " + self.URL)
+        with mock.patch.object(sc, "fetch_ics", self.fake_fetch(boom)):
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 30)), "ics_error")
+            sc._ics_startup_done = True
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 40)), "idle")           # no retry hammering
+            sc._ics_startup_done = False
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 9, 0)), "ics_error")       # restart same day
+            self.assertEqual(sc.ics_tick(self.send, OWNER, datetime(2026, 11, 2, 3, 30)), "ics_error")      # next day
+        self.assertEqual(len(self.out), 2)                           # day 1 once, day 2 once
+        self.assertTrue(all("SECRETTOKEN" not in m and "calendar.google.com" not in m for m in self.out))
+        self.assertIn("[feed]", self.out[0])
+
+    def test_failed_send_is_retried_next_attempt(self):
+        boom = ValueError("not an iCal feed")
+        with mock.patch.object(sc, "fetch_ics", self.fake_fetch(boom)):
+            sc.ics_tick(lambda c, t: False, OWNER, datetime(2026, 11, 1, 3, 30))
+            sc._ics_startup_done = False
+            sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 4, 0))
+        self.assertEqual(len(self.out), 1)
+
+    def test_error_leaves_shifts_untouched(self):
+        self.shifts(ev("2026-11-05", "07:00", "15:00"))
+        with mock.patch.object(sc, "fetch_ics", self.fake_fetch(OSError("net down"))):
+            sc.ics_tick(self.send, OWNER, datetime(2026, 11, 1, 3, 30))
+        self.assertEqual(len(sc.load_shifts()), 1)
+
+    def test_fetch_rejects_non_ical_response(self):
+        class R:
+            def read(self):
+                return b"<html>sign in</html>"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        with mock.patch.object(sc.urllib.request, "urlopen", lambda *a, **k: R()):
+            with self.assertRaises(ValueError):
+                sc.fetch_ics()
+
+    def test_poll_once_runs_ics_tick(self):
+        calls = []
+        with mock.patch.object(sc, "ics_tick", lambda s, o: calls.append(o) or "idle"), \
+             mock.patch.object(bot, "api", lambda *a, **k: []), \
+             mock.patch.object(bot, "checkin_tick", lambda o: "idle"), mock.patch.object(bot, "sweat_tick", lambda o: "idle"), \
+             mock.patch.object(coach, "tick", lambda s, o: "idle"), mock.patch.object(bot, "write_heartbeat", lambda *a: None):
+            bot.poll_once(None, OWNER)
+        self.assertEqual(calls, [OWNER])
+
+
 if __name__ == "__main__":
     unittest.main()

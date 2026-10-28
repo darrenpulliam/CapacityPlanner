@@ -123,7 +123,7 @@ def evening_message(now: datetime) -> Optional[str]:
     t = tonight(now)
     bed: datetime = t["bed"]
     cutoff = bed - timedelta(hours=gc.CAFFEINE_WARN_BEFORE_BED_H)
-    flags = " + ".join(f for f in (("clopen" if nxt["clopen"] else ""),
+    flags = " + ".join(f for f in (("clopen" if nxt["clopen"] else ("near-clopen" if nxt["near_clopen"] else "")),
                                    (f"day {nxt['consecutive_days']} in a row" if nxt["consecutive_days"] > 1 else "")) if f)
     _, drink = drink_advice(now)
     return (f"Hard shift tomorrow: {nxt['_s'].strftime('%a')} {clock(nxt['_s'])}-{clock(nxt['_e'])}, "
@@ -168,7 +168,7 @@ def weekly_message(today: Optional[date] = None) -> str:
         lines.append("- No shift has a next-day Body Battery reading yet.")
     week = [r for r in rows if r["date"] >= (today - timedelta(days=7)).isoformat()]
     lines.append(f"This week: {len(week)} shifts, {sum(1 for r in week if r['bb_risk'])} BB RISK, "
-                 f"{sum(1 for r in week if r['clopen'])} clopen.")
+                 f"{sum(1 for r in week if r['clopen'] == 'CLOPEN')} clopen, {sum(1 for r in week if r['clopen'] == 'NEAR-CLOPEN')} near-clopen.")
     h = sc.habit_effects(today=today)
     if h["drink_n"] and h["dry_n"]:
         d, y = h["drink"]["recharge"], h["dry"]["recharge"]
