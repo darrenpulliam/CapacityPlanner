@@ -1210,6 +1210,97 @@ def last_drink_time(night: date) -> str:
     return ev[-1] if ev else ""
 
 
+CAFFEINE_CSV = DATA_DIR / "caffeine_events.csv"   # ts,day,count,what,mg — one row per log; count/mg < 0 = /undo of the last one
+CAFFEINE_DAY_ROLLOVER_H = 4                       # a dose before 04:00 still belongs to the previous caffeine day
+CAFFEINE_WARN_BEFORE_BED_H = 8                    # warn when logging within this many hours of bedtime
+CAFFEINE_DEFAULT_MG = {"bloom": 180.0, "energy drink": 200.0, "coffee": 95.0}   # per unit; .env CAFFEINE_MG_<KEY> overrides
+CAFFEINE_ENV_KEY = {"bloom": "CAFFEINE_MG_BLOOM", "energy drink": "CAFFEINE_MG_ENERGY", "coffee": "CAFFEINE_MG_COFFEE"}
+CAFFEINE_KIND = {"monster": "energy drink", "red bull": "energy drink", "energy drink": "energy drink",
+                 "energy": "energy drink", "bloom": "bloom", "coffee": "coffee"}   # label -> mg family
+
+
+def caffeine_mg_each(what: str) -> float:
+    """mg for ONE unit of `what` (.env wins; a bad value falls back to the default)."""
+    kind = CAFFEINE_KIND.get((what or "").lower(), "energy drink")
+    try:
+        v = float(os.getenv(CAFFEINE_ENV_KEY[kind], ""))
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    return CAFFEINE_DEFAULT_MG[kind]
+
+
+def caffeine_day(ts: datetime) -> date:
+    return (ts - timedelta(hours=CAFFEINE_DAY_ROLLOVER_H)).date()
+
+
+def caffeine_log(count: float, what: str, at: Optional[datetime] = None, mg: Optional[float] = None) -> Dict[str, Any]:
+    """Append one dose (count > 0) or an undo (count < 0). mg is the row total (count x per-unit unless given)."""
+    at = at or datetime.now()
+    total = mg if mg is not None else count * caffeine_mg_each(what)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new = not CAFFEINE_CSV.exists() or CAFFEINE_CSV.stat().st_size == 0
+    row = [at.isoformat(timespec="seconds"), caffeine_day(at).isoformat(), f"{count:g}", what, f"{total:g}"]
+    with CAFFEINE_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["ts", "day", "count", "what", "mg"])
+        w.writerow(row)
+    return {"ts": row[0], "day": row[1], "count": count, "what": what, "mg": total}
+
+
+def caffeine_events() -> List[Dict[str, Any]]:
+    """Doses still standing, oldest first (an undo row removes the latest earlier dose of that day)."""
+    out: List[Dict[str, Any]] = []
+    try:
+        if not CAFFEINE_CSV.exists():
+            return out
+        with CAFFEINE_CSV.open(encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                c, mg = float(r["count"]), float(r["mg"])
+                if c > 0:
+                    out.append({"ts": r["ts"], "day": r["day"], "count": c, "what": r.get("what", ""), "mg": mg})
+                else:
+                    for i in range(len(out) - 1, -1, -1):
+                        if out[i]["day"] == r["day"]:
+                            out.pop(i)
+                            break
+    except Exception as e:
+        log.warning("caffeine events unreadable: %s: %s", type(e).__name__, e)
+    return out
+
+
+def caffeine_mg_for_day(day: date) -> float:
+    return sum(e["mg"] for e in caffeine_events() if e["day"] == day.isoformat())
+
+
+def caffeine_last_time(day: date) -> str:
+    ev = [e["ts"] for e in caffeine_events() if e["day"] == day.isoformat()]
+    return ev[-1] if ev else ""
+
+
+def caffeine_undo(at: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    ev = caffeine_events()
+    if not ev:
+        return None
+    last = ev[-1]
+    caffeine_log(-last["count"], last["what"], at=at, mg=-last["mg"])
+    return last
+
+
+def caffeine_line(day: date) -> str:
+    """Morning-card line: that day's caffeine total and the last dose time."""
+    mg, last = caffeine_mg_for_day(day), caffeine_last_time(day)
+    if not mg:
+        return "Caffeine yesterday: none logged"
+    try:
+        when = datetime.fromisoformat(last).strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        when = "?"
+    return f"Caffeine yesterday: {mg:g} mg, last at {when}"
+
+
 def checkin_drinks_value(v: Any) -> Optional[float]:
     """Check-in drinks answer -> number for alcohol.csv: "4+" -> 4.0; "" / "unknown" -> None (not logged)."""
     try:
@@ -1523,6 +1614,7 @@ def card(payload: Dict[str, Any]) -> str:
         f"{weather_line(payload.get('weather'))}\n"
         f"{slept_line(m)}\n"
         f"{alcohol_line(m)}\n"
+        f"{caffeine_card_line(payload)}\n"
         f"{checkin_line(payload.get('checkin'))}\n"
         f"{overnight_line(payload.get('overnight'))}\n"
         f"Deep-work blocks: {payload['plan'].get('deep_blocks', '?')}\n"
@@ -1573,6 +1665,13 @@ def alcohol_line(m: Dict[str, Any]) -> str:
     if v is None:
         return "Alcohol last night: not logged — /drinks N"
     return f"Alcohol last night: {v:g}"
+
+
+def caffeine_card_line(payload: Dict[str, Any]) -> str:
+    try:
+        return caffeine_line(date.fromisoformat(payload["date"]) - timedelta(days=1))
+    except Exception:
+        return "Caffeine yesterday: n/a"
 
 
 def as_of_phrase(payload: Dict[str, Any]) -> str:

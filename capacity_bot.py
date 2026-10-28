@@ -15,7 +15,16 @@ Commands (owner chat only; TELEGRAM_CHAT_ID in this folder's .env, never anyone 
              date); an explicit date wins: /drinks 2 10/22. Re-logging a night appends a new row; the
              morning run takes the last row (garmin_capacity.alcohol_for_night). Never assumes 0.
   /checkin   start the nightly check-in now (see below)
+  /caffeine [N] bloom|energy drink|monster|red bull|coffee   (or just text "bloom", "2 coffee") -> data\\caffeine_events.csv
+             (ts,day,count,what,mg; mg defaults bloom 180 / energy 200 / coffee 95, .env CAFFEINE_MG_BLOOM / _ENERGY /
+             _COFFEE override). Warns when logged later than bedtime - 8 h. /undo removes whichever of the last
+             drink / caffeine is newer. Free text must be the whole message, so "can I drink coffee" is not a log.
+  /candrink  (or text "can I drink tonight?") coach answer from tomorrow's shift, today's tier and bedtime; see coach.py
+  /scorecard rebuild data\\shift_scorecard.csv + chart + report and send the by-type summary (shift_scorecard.py)
   /help      list the commands
+Coach messages (coach.py, sent by the poll loop, deduped in data\\coach_state.json): 13:30 the day before a BB RISK
+shift, "home from a late close" wind-down, Sundays 18:00 weekly look-back. Shifts come from data\\shifts.csv, filled by
+`python shift_scorecard.py --import-ics` (SHIFT_ICS_URL in .env) or `--import-shifts events.json`.
 Anything else gets a one-line hint. The commands are registered with setMyCommands at start.
 
 Nightly check-in (2026-10-25, display only): at CHECKIN_TIME (default 23:15, .env CHECKIN_TIME=HH:MM) the bot
@@ -59,6 +68,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import garmin_capacity as gc   # load_env, card(), _TLS_CTX, DATA_DIR
+import coach                   # drink advice + scheduled coaching messages (pure logic)
+import shift_scorecard as sc   # shifts, scorecard, report
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = gc.DATA_DIR
@@ -78,10 +89,14 @@ COMMANDS = [
     {"command": "checkin", "description": "Nightly check-in now: drinks, gluten, new/older wounds, exercise (buttons)"},
     {"command": "sweat", "description": "Night-sweat question for last night (buttons)"},
     {"command": "drink", "description": "Log a drink now (or just text: beer, 2 wine, bourbon)"},
-    {"command": "undo", "description": "Remove the last drink you texted"},
+    {"command": "undo", "description": "Remove the last drink or caffeine you logged"},
+    {"command": "caffeine", "description": "Log caffeine: /caffeine 2 bloom (or just text: bloom, coffee, red bull)"},
+    {"command": "candrink", "description": "Can I drink tonight? (tomorrow's shift, today's tier, bedtime)"},
+    {"command": "scorecard", "description": "Shift scorecard: rebuild and send the summary"},
     {"command": "help", "description": "List the commands"},
 ]
-HINT = "Unknown command. Try /capacity, /today, /drinks, /drink, /undo, /checkin, /sweat or /help."
+HINT = ("Unknown command. Try /capacity, /today, /drinks, /drink, /caffeine, /candrink, /scorecard, /undo, "
+        "/checkin, /sweat or /help.")
 DRINKS_USAGE = ("Usage: /drinks N [M/D]  — N = 0-10 drinks (halves OK, e.g. 1.5). "
                 "Before 2 PM it counts for last night, from 2 PM on for tonight; add a date to override: /drinks 2 10/22")
 
@@ -799,9 +814,92 @@ def cmd_drink_text(text: str, now: Optional[datetime] = None, command: bool = Fa
     return f"Logged {count} {what} at {now.strftime('%I:%M %p').lstrip('0')}. {_day_label(night)}: {total:g} total."
 
 
+# ───────────────────────────── caffeine ─────────────────────────────
+CAFFEINE_WORDS = r"(bloom|energy\s+drinks?|monsters?|red\s?bulls?|coffees?)"
+CAFFEINE_TEXT_RE = re.compile(r"^(?:i\s+)?(?:(?:just\s+)?(?:had|drank)\s+)?(?:(\d{1,2})\s*x?\s*)?(?:a\s+|an\s+|one\s+)?"
+                              + CAFFEINE_WORDS + r"(?:\s*x\s*(\d{1,2}))?\s*[.!]*$")
+CAFFEINE_USAGE = "Usage: /caffeine [N] bloom|energy drink|monster|red bull|coffee   e.g. /caffeine 2 bloom"
+
+
+def _canon_caffeine(word: str) -> str:
+    w = re.sub(r"\s+", " ", word.lower().strip())
+    if w in ("redbull", "red bull", "redbulls", "red bulls"):
+        return "red bull"
+    return w[:-1] if w.endswith("s") else w
+
+
+def parse_caffeine_text(text: str, command: bool = False):
+    """'bloom' / '2 coffee' / 'red bull' / '/caffeine 2 bloom' -> (count, what); anything else -> None.
+    Free text must be the WHOLE message (so 'can I drink coffee tonight' is a question, not a log)."""
+    t = (text or "").lower().strip()
+    if command:
+        parts = t.split(None, 1)
+        t = parts[1].strip() if len(parts) > 1 else ""
+        m = re.match(r"^(?:(\d{1,2})\s*x?\s*)?" + CAFFEINE_WORDS + r"(?:\s*x?\s*(\d{1,2}))?$", t)
+    else:
+        m = CAFFEINE_TEXT_RE.match(t)
+    if not m:
+        return None
+    n1, word, n2 = m.group(1), m.group(2), m.group(3)
+    count = int(n1 or n2 or 1)
+    if not 1 <= count <= 10:
+        return None
+    return count, _canon_caffeine(word)
+
+
+def cmd_caffeine_text(text: str, now: Optional[datetime] = None, command: bool = False) -> Optional[str]:
+    now = now or datetime.now()
+    parsed = parse_caffeine_text(text, command)
+    if not parsed:
+        return CAFFEINE_USAGE if command else None
+    count, what = parsed
+    try:
+        gc.load_env()
+        ev = gc.caffeine_log(count, what, at=now)
+        day_total = gc.caffeine_mg_for_day(date.fromisoformat(ev["day"]))
+    except Exception as e:
+        log.warning("caffeine write failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not log the caffeine ({type(e).__name__})."
+    msg = f"Logged {count} {what} ({ev['mg']:g} mg) at {coach.clock(now)}. Today: {day_total:g} mg."
+    t = coach.tonight(now)
+    cutoff = t["bed"] - timedelta(hours=gc.CAFFEINE_WARN_BEFORE_BED_H)
+    if now > cutoff:
+        msg += (f"\n⚠️ Past your caffeine cutoff ({coach.clock(cutoff)}, 8 h before the {coach.clock(t['bed'])} bed"
+                f"{', assumed' if t['assumed'] else ''}). Expect it to cost sleep.")
+    return msg
+
+
+def cmd_candrink(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    try:
+        return coach.drink_advice(now)[1]
+    except Exception as e:
+        log.warning("candrink failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not work that out ({type(e).__name__})."
+
+
+def cmd_scorecard() -> str:
+    try:
+        r = sc.build()
+        rows = sc.build_rows()
+        lines = [f"Shift scorecard: {r['rows']} shifts. Report: {r['report']}"]
+        for s in sc.summary_by_type(rows):
+            lines.append(f"{s['type']}: {s['shifts']} shifts, next-day BB {sc._fmt(s['bb'])}"
+                         + (" (too few to conclude)" if s["few"] else ""))
+        return "\n".join(lines)
+    except Exception as e:
+        log.warning("scorecard failed: %s: %s", type(e).__name__, e)
+        return f"⚠️ Could not build the scorecard ({type(e).__name__})."
+
+
 def cmd_undo(now: Optional[datetime] = None) -> str:
     now = now or datetime.now()
     try:
+        d_ev, c_ev = gc.drink_events(), gc.caffeine_events()
+        if c_ev and (not d_ev or c_ev[-1]["ts"] > d_ev[-1]["ts"]):
+            last = gc.caffeine_undo(now)
+            left = gc.caffeine_mg_for_day(date.fromisoformat(last["day"]))
+            return f"Removed {last['count']:g} {last['what']} ({last['mg']:g} mg). Today: {left:g} mg."
         last = gc.drink_undo(now)
         if not last:
             return "Nothing to undo."
@@ -877,11 +975,17 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
     if str(chat_id) != str(owner) or str(sender) != str(owner):
         log.warning("ignored message from non-owner chat=%s from=%s", chat_id, sender)
         return "ignored_non_owner"
-    cmd = parse_command(message.get("text") or "")
+    text0 = message.get("text") or ""
+    cmd = parse_command(text0)
     if cmd is None:
-        if not parse_drink_text(message.get("text") or ""):
+        if coach.is_drink_question(text0):          # before drink text: "can I drink tonight" must not log a drink
+            cmd = "candrink"
+        elif parse_caffeine_text(text0):            # before drink text: "energy drink" contains "drink"
+            cmd = "caffeine_text"
+        elif parse_drink_text(text0):
+            cmd = "drink_text"
+        else:
             return "ignored_text"
-        cmd = "drink_text"
     age = (now or time.time()) - float(message.get("date") or 0)
     if age > STALE_S:
         send(chat_id, f"Skipped /{cmd} sent {int(age // 60)} min ago while I was offline. Send it again.")
@@ -899,6 +1003,15 @@ def handle(message: Dict[str, Any], owner: str, now: Optional[float] = None) -> 
         reply = cmd_drink_text(message.get("text") or "", datetime.fromtimestamp(now) if now else None, command=(cmd == "drink"))
         send(chat_id, reply or "Try: /drink, or /drink 2 wine (or just text: beer, 2 wine, bourbon).")
         return "drink_text"
+    if cmd in ("caffeine", "caffeine_text"):
+        send(chat_id, cmd_caffeine_text(text0, datetime.fromtimestamp(now) if now else None, command=(cmd == "caffeine")))
+        return "caffeine"
+    if cmd == "candrink":
+        send(chat_id, cmd_candrink(datetime.fromtimestamp(now) if now else None))
+        return "candrink"
+    if cmd == "scorecard":
+        send(chat_id, cmd_scorecard())
+        return "scorecard"
     if cmd == "undo":
         send(chat_id, cmd_undo(datetime.fromtimestamp(now) if now else None))
         return "undo"
@@ -941,6 +1054,9 @@ def poll_once(offset: Optional[int], owner: str) -> Optional[int]:
     stick = sweat_tick(owner)
     if stick not in ("idle", "sweat_waiting"):
         last_cmd = stick
+    ctick = coach.tick(send, owner)
+    if ctick not in ("idle", "error"):
+        last_cmd = ctick
     write_heartbeat(offset, last_cmd)
     return offset
 
